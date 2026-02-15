@@ -812,22 +812,236 @@ Remove-Item -Force "C:\WinServer-Template-Prep-v3.ps1" -ErrorAction SilentlyCont
 Write-OK "Template prep scripts removed from C:\"
 
 # =====================================================================
-# STEP 17: CLEAN EVENT LOGS (NOW JUST BEFORE SYSPREP)
+# STEP 17: CLEAN ALL EVENT LOGS AND POWERSHELL HISTORY (NOW JUST BEFORE SYSPREP)
 # =====================================================================
-Write-Step "17/19" "Cleaning Event Logs"
+Write-Step "17/19" "Cleaning All Event Logs and PowerShell History"
 
-Write-Host "  Clearing all event logs..." -ForegroundColor White
-Get-EventLog -LogName * -ErrorAction SilentlyContinue | ForEach-Object {
-    Write-Host "    Clearing $($_.Log) log..." -ForegroundColor Gray
-    Clear-EventLog -LogName $_.Log -ErrorAction SilentlyContinue
+Write-Host "  Cleaning ALL Windows Event Logs..." -ForegroundColor Yellow
+
+# Method 1: Clear standard event logs using Clear-EventLog
+Write-Host "  Clearing standard event logs (Application, Security, Setup, System, etc)..." -ForegroundColor White
+$standardLogs = @(
+    "Application",
+    "Security",
+    "Setup",
+    "System",
+    "ForwardedEvents",
+    "HardwareEvents",
+    "Internet Explorer",
+    "Key Management Service",
+    "Media Center",
+    "Microsoft-Windows-Diagnostics-Performance/Operational",
+    "Microsoft-Windows-Kernel-WHEA/Operational",
+    "Microsoft-Windows-NetworkProfile/Operational",
+    "Microsoft-Windows-TaskScheduler/Operational",
+    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+    "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
+    "Microsoft-Windows-Windows Firewall With Advanced Security/Firewall",
+    "Microsoft-Windows-WinRM/Operational",
+    "OpenSSH/Operational",
+    "Windows PowerShell"
+)
+
+foreach ($log in $standardLogs) {
+    Write-Host "    Clearing $log log..." -ForegroundColor Gray
+    try {
+        Clear-EventLog -LogName $log -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host "      (Log may not exist or is already empty)" -ForegroundColor DarkGray
+    }
 }
 
-Write-Host "  Clearing Windows event logs via wevtutil..." -ForegroundColor White
-wevtutil el 2>$null | ForEach-Object {
-    Write-Host "    Clearing $_ log..." -ForegroundColor Gray
-    $null = wevtutil cl "$_" 2>&1
+# Method 2: Use wevtutil to get ALL logs and clear them (most comprehensive)
+Write-Host "`n  Getting complete list of all Windows event logs..." -ForegroundColor White
+$allLogs = wevtutil el 2>$null
+$logCount = ($allLogs | Measure-Object).Count
+Write-Host "  Found $logCount total event logs. Clearing each one..." -ForegroundColor Yellow
+
+$clearedLogs = 0
+$failedLogs = 0
+
+$allLogs | ForEach-Object {
+    $logName = $_
+    Write-Host "    Clearing: $logName" -ForegroundColor Gray
+    try {
+        $result = wevtutil cl "$logName" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $clearedLogs++
+        } else {
+            Write-Host "      (Unable to clear - may be protected or empty)" -ForegroundColor DarkGray
+            $failedLogs++
+        }
+    } catch {
+        Write-Host "      (Error: $_ )" -ForegroundColor DarkGray
+        $failedLogs++
+    }
 }
-Write-OK "All event logs cleared"
+
+Write-Host "`n  Event log summary:" -ForegroundColor White
+Write-Host "    Total logs found: $logCount" -ForegroundColor Gray
+Write-Host "    Successfully cleared: $clearedLogs" -ForegroundColor Green
+Write-Host "    Failed/Skipped: $failedLogs" -ForegroundColor Yellow
+
+# Method 3: Explicitly clear the most important ones again to be sure
+Write-Host "`n  Explicitly verifying critical logs are cleared..." -ForegroundColor White
+$criticalLogs = @(
+    "Application",
+    "Security",
+    "Setup",
+    "System",
+    "ForwardedEvents"
+)
+
+foreach ($log in $criticalLogs) {
+    Write-Host "    Verifying $log is empty..." -ForegroundColor Gray
+    try {
+        # Clear with wevtutil again for these critical ones
+        wevtutil cl "$log" 2>$null
+        
+        # Also try to clear the .evtx file directly
+        $evtxPath = "C:\Windows\System32\winevt\Logs\$log.evtx"
+        if (Test-Path $evtxPath) {
+            # Stop the Windows Event Log service temporarily to clear the file
+            Stop-Service -Name EventLog -Force -ErrorAction SilentlyContinue
+            Remove-Item -Force $evtxPath -ErrorAction SilentlyContinue
+            Start-Service -Name EventLog -ErrorAction SilentlyContinue
+            Write-Host "      $log.evtx file removed" -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host "      (Could not verify $log)" -ForegroundColor DarkGray
+    }
+}
+
+# Clean PowerShell event logs specifically
+Write-Host "`n  Clearing PowerShell event logs..." -ForegroundColor White
+$psEventLogs = @(
+    "Windows PowerShell",
+    "Microsoft-Windows-PowerShell/Operational",
+    "Microsoft-Windows-PowerShell/Analytic",
+    "Microsoft-Windows-PowerShell/Admin",
+    "PowerShellCore/Operational",
+    "PowerShellCore/Analytic",
+    "PowerShellCore/Admin"
+)
+
+foreach ($log in $psEventLogs) {
+    Write-Host "    Clearing $log log..." -ForegroundColor Gray
+    wevtutil cl "$log" 2>$null
+}
+
+# Clean PowerShell console history for all users
+Write-Host "`n  Cleaning PowerShell history for all users..." -ForegroundColor White
+
+# Get all user profile directories
+$userProfiles = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @('Public', 'Default', 'All Users') }
+
+foreach ($profile in $userProfiles) {
+    $userHistory = @(
+        "$($profile.FullName)\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt",
+        "$($profile.FullName)\AppData\Roaming\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt",
+        "$($profile.FullName)\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\PSReadLineHistory.txt",
+        "$($profile.FullName)\AppData\Roaming\Microsoft\PowerShell\PSReadLine\PSReadLineHistory.txt"
+    )
+    
+    foreach ($historyFile in $userHistory) {
+        if (Test-Path $historyFile) {
+            Write-Host "    Removing history for user $($profile.Name): $historyFile" -ForegroundColor Gray
+            Remove-Item -Force $historyFile -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Clean current user's PowerShell history
+Write-Host "  Cleaning current user PowerShell history..." -ForegroundColor White
+$currentUserHistory = @(
+    "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt",
+    "$env:APPDATA\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt",
+    "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\PSReadLineHistory.txt",
+    "$env:APPDATA\Microsoft\PowerShell\PSReadLine\PSReadLineHistory.txt"
+)
+
+foreach ($historyFile in $currentUserHistory) {
+    if (Test-Path $historyFile) {
+        Write-Host "    Removing current user history: $historyFile" -ForegroundColor Gray
+        Remove-Item -Force $historyFile -ErrorAction SilentlyContinue
+    }
+}
+
+# Clear PowerShell module analysis cache
+Write-Host "  Clearing PowerShell module analysis cache..." -ForegroundColor White
+$moduleAnalysisCache = "$env:LOCALAPPDATA\Microsoft\Windows\PowerShell\ModuleAnalysisCache"
+if (Test-Path $moduleAnalysisCache) {
+    Remove-Item -Force $moduleAnalysisCache -ErrorAction SilentlyContinue
+    Write-OK "PowerShell module analysis cache cleared"
+}
+
+# Clear PowerShell transcript logs
+Write-Host "  Clearing PowerShell transcript logs..." -ForegroundColor White
+$transcriptPaths = @(
+    "$env:USERPROFILE\My Documents\PowerShell_transcript*.txt",
+    "$env:USERPROFILE\Documents\PowerShell_transcript*.txt",
+    "C:\Windows\Logs\PowerShell_transcript*.txt",
+    "C:\Windows\Temp\PowerShell_transcript*.txt",
+    "C:\Users\*\Documents\PowerShell_transcript*.txt",
+    "C:\Users\*\My Documents\PowerShell_transcript*.txt"
+)
+
+foreach ($path in $transcriptPaths) {
+    Get-ChildItem $path -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "    Removing transcript: $($_.FullName)" -ForegroundColor Gray
+        Remove-Item -Force $_.FullName -ErrorAction SilentlyContinue
+    }
+}
+
+# Clear Windows Event Log files directly
+Write-Host "`n  Cleaning Windows Event Log files (.evtx)..." -ForegroundColor White
+$evtxFiles = Get-ChildItem "C:\Windows\System32\winevt\Logs\*.evtx" -ErrorAction SilentlyContinue
+$evtxCount = ($evtxFiles | Measure-Object).Count
+Write-Host "  Found $evtxCount event log files" -ForegroundColor Gray
+
+if ($evtxCount -gt 0) {
+    Write-Host "  Stopping Windows Event Log service to clear files..." -ForegroundColor Yellow
+    Stop-Service -Name EventLog -Force -ErrorAction SilentlyContinue
+    
+    $clearedEvtx = 0
+    foreach ($evtx in $evtxFiles) {
+        Write-Host "    Removing: $($evtx.Name)" -ForegroundColor Gray
+        try {
+            Remove-Item -Force $evtx.FullName -ErrorAction SilentlyContinue
+            $clearedEvtx++
+        } catch {
+            Write-Host "      (Failed to remove)" -ForegroundColor DarkGray
+        }
+    }
+    
+    Write-Host "  Starting Windows Event Log service..." -ForegroundColor Yellow
+    Start-Service -Name EventLog -ErrorAction SilentlyContinue
+    
+    Write-Host "  Event log files summary:" -ForegroundColor White
+    Write-Host "    Files found: $evtxCount" -ForegroundColor Gray
+    Write-Host "    Files removed: $clearedEvtx" -ForegroundColor Green
+    
+    # Wait for service to recreate essential logs
+    Start-Sleep -Seconds 5
+}
+
+# Final verification - check critical logs are empty or recreated
+Write-Host "`n  Final verification of critical logs..." -ForegroundColor White
+$verificationLogs = @("Application", "System", "Security", "Setup", "ForwardedEvents")
+foreach ($log in $verificationLogs) {
+    try {
+        $recordCount = (wevtutil qe "$log" /f:text /c:1 2>$null | Measure-Object).Count
+        if ($recordCount -eq 0 -or $null -eq $recordCount) {
+            Write-Host "    $log is empty" -ForegroundColor Green
+        } else {
+            Write-Host "    $log has records (normal after service restart)" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "    $log is being recreated" -ForegroundColor Yellow
+    }
+}
+
+Write-OK "All event logs and PowerShell history cleared"
 
 # =====================================================================
 # STEP 18: FINAL VERIFICATION
