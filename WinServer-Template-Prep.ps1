@@ -426,7 +426,7 @@ if ($maxSize -and $currentSize -and ($maxSize -gt $currentSize)) {
 # =====================================================================
 Write-Step "11/19" "Installing Cloudbase-Init"
 
-$cbInstalled = Test-Path "C:\Program Files\Cloudbase Solutions\Cloudbase-Init"
+$cbInstalled = Test-Path "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf"
 if ($cbInstalled) {
     Write-Warn "Cloudbase-Init already installed, skipping download"
 } else {
