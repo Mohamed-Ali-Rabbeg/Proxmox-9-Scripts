@@ -2,10 +2,10 @@
 # Windows Server Template Preparation Script for Proxmox + Cloudbase-Init
 # Compatible: Windows Server 2019 / 2022 / 2025 Datacenter
 # Purpose: Prepares a fresh Windows Server install for templating
-# Author: HostStronger Infrastructure Team
-# Version: 3.1
+# Author: Hydra (Mohamed Ali RABBEG)
+# Version: 1.0.3
 # Usage: Run as Administrator in PowerShell after fresh OS installation
-#        with VirtIO drivers and QEMU Guest Agent already installed
+#        with VirtIO ISO mounted
 ########################################################################
 
 param(
@@ -31,7 +31,7 @@ Start-Transcript -Path $logFile -Force
 Write-Host "================================================================" -ForegroundColor Yellow
 Write-Host "  WINDOWS SERVER TEMPLATE PREPARATION FOR PROXMOX" -ForegroundColor Yellow
 Write-Host "  Cloudbase-Init + Password Injection + Optimization" -ForegroundColor Yellow
-Write-Host "  Version 3.1 - HostStronger" -ForegroundColor Yellow
+Write-Host "  Version 3.3 - HostStronger" -ForegroundColor Yellow
 Write-Host "================================================================" -ForegroundColor Yellow
 Write-Host ""
 
@@ -45,33 +45,123 @@ else { $osShort = "SVR" }
 Write-Host "Detected OS: $osVersion" -ForegroundColor White
 Write-Host ""
 
-if (-not $Force) {
-    $confirm = Read-Host "This will prepare this VM for templating. Continue? (yes/no)"
-    if ($confirm -ne "yes") {
-        Write-Host "Aborted." -ForegroundColor Red
-        Stop-Transcript
-        exit
+# =====================================================================
+# STEP 1: CHECK AND INSTALL VIRTIO DRIVERS + QEMU GUEST AGENT
+# =====================================================================
+Write-Step "1/19" "Checking VirtIO Drivers and QEMU Guest Agent"
+
+# Check if QEMU Guest Agent is already installed
+$qemuInstalled = Get-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
+if ($qemuInstalled) {
+    Write-OK "QEMU Guest Agent is already installed"
+} else {
+    Write-Warn "QEMU Guest Agent not found - will install from VirtIO ISO"
+}
+
+# Find VirtIO ISO drive
+$virtioDrive = $null
+$cdDrives = Get-WmiObject -Class Win32_CDROMDrive
+foreach ($drive in $cdDrives) {
+    if ($drive.MediaLoaded -and $drive.VolumeName -like "*VIRTIO*") {
+        $virtioDrive = $drive.Drive
+        Write-OK "Found VirtIO ISO mounted at $virtioDrive with label: $($drive.VolumeName)"
+        break
     }
 }
 
+if (-not $virtioDrive) {
+    Write-Err "VirtIO ISO not found! Please mount the VirtIO ISO file and try again."
+    Write-Host "Available CD/DVD drives:" -ForegroundColor Yellow
+    $cdDrives | ForEach-Object { Write-Host "  $($_.Drive) - $($_.VolumeName) (Media loaded: $($_.MediaLoaded))" }
+    Stop-Transcript
+    exit 1
+}
+
+# Install VirtIO drivers if needed
+Write-Host "`n  Installing VirtIO drivers from $virtioDrive..." -ForegroundColor White
+
+$driverTypes = @(
+    @{Name="Network (NetKVM)"; Path="$virtioDrive\NetKVM\2k22\amd64"},
+    @{Name="Block (viostor)"; Path="$virtioDrive\viostor\2k22\amd64"},
+    @{Name="Balloon (balloon)"; Path="$virtioDrive\balloon\2k22\amd64"}
+)
+
+foreach ($driver in $driverTypes) {
+    Write-Host "  Installing $($driver.Name) drivers..." -ForegroundColor Gray
+    if (Test-Path $driver.Path) {
+        pnputil /add-driver "$($driver.Path)\*.inf" /install
+        Write-OK "$($driver.Name) drivers installed"
+    } else {
+        Write-Warn "Driver path not found: $($driver.Path)"
+    }
+}
+
+# Install QEMU Guest Agent if not already installed
+if (-not $qemuInstalled) {
+    Write-Host "`n  Installing QEMU Guest Agent..." -ForegroundColor White
+    
+    # Find QEMU GA installer (usually in guest-agent folder)
+    $qemuGaPaths = @(
+        "$virtioDrive\guest-agent\qemu-ga-x86_64.msi",
+        "$virtioDrive\guest-agent\qemu-ga-x64.msi",
+        "$virtioDrive\guest-agent\*.msi"
+    )
+    
+    $qemuGaInstaller = $null
+    foreach ($path in $qemuGaPaths) {
+        $files = Get-ChildItem $path -ErrorAction SilentlyContinue
+        if ($files) {
+            $qemuGaInstaller = $files[0].FullName
+            break
+        }
+    }
+    
+    if ($qemuGaInstaller) {
+        Write-Host "  Found QEMU GA installer: $qemuGaInstaller" -ForegroundColor Gray
+        Write-Host "  Installing QEMU Guest Agent..." -ForegroundColor Gray
+        Start-Process msiexec.exe -ArgumentList "/i `"$qemuGaInstaller`" /qn /norestart" -Wait
+        Write-OK "QEMU Guest Agent installed"
+        
+        # Start the service
+        Start-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
+        Set-Service -Name "QEMU-GA" -StartupType Automatic
+        Write-OK "QEMU Guest Agent service started and set to automatic"
+    } else {
+        Write-Err "Could not find QEMU Guest Agent installer on VirtIO ISO"
+    }
+}
+
+# Verify QEMU Guest Agent is running
+$qemuService = Get-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
+if ($qemuService) {
+    Write-OK "QEMU Guest Agent status: $($qemuService.Status)"
+} else {
+    Write-Warn "QEMU Guest Agent service not found"
+}
+
+Write-Host "`n  VirtIO driver installation complete. Installed drivers:" -ForegroundColor White
+pnputil /enum-drivers | Select-String "virtio|qemu" -Context 0,2
+Write-OK "VirtIO drivers installation completed"
+
 # =====================================================================
-# STEP 1: SET TIMEZONE TO PARIS (UTC+1)
+# STEP 2: SET TIMEZONE TO PARIS (UTC+1)
 # =====================================================================
-Write-Step "1/18" "Setting Timezone to Paris (Romance Standard Time / UTC+1)"
+Write-Step "2/19" "Setting Timezone to Paris (Romance Standard Time / UTC+1)"
 
 Set-TimeZone -Id "Romance Standard Time"
 $tz = Get-TimeZone
 Write-OK "Timezone set to: $($tz.DisplayName)"
 
-w32tm /config /manualpeerlist:"time.windows.com,0x1 pool.ntp.org,0x1" /syncfromflags:manual /reliable:yes /update 2>&1 | Out-Null
+Write-Host "  Configuring NTP time sync..." -ForegroundColor White
+w32tm /config /manualpeerlist:"time.windows.com,0x1 pool.ntp.org,0x1" /syncfromflags:manual /reliable:yes /update
 Restart-Service w32time -ErrorAction SilentlyContinue
-w32tm /resync /force 2>&1 | Out-Null
+w32tm /resync /force
 Write-OK "NTP time sync configured"
 
 # =====================================================================
-# STEP 2: SET PROFESSIONAL HOSTNAME
+# STEP 3: SET PROFESSIONAL HOSTNAME
 # =====================================================================
-Write-Step "2/18" "Setting Professional Hostname"
+Write-Step "3/19" "Setting Professional Hostname"
 
 $randomSuffix = -join ((65..90) + (48..57) | Get-Random -Count 5 | ForEach-Object { [char]$_ })
 $newHostname = "WIN-$osShort-$randomSuffix"
@@ -83,15 +173,15 @@ Rename-Computer -NewName $newHostname -Force -ErrorAction SilentlyContinue -Warn
 Write-OK "Hostname set to $newHostname (template default)"
 
 # =====================================================================
-# STEP 3: WINDOWS UPDATES
+# STEP 4: WINDOWS UPDATES
 # =====================================================================
-Write-Step "3/18" "Running Windows Updates"
+Write-Step "4/19" "Running Windows Updates"
 
 if ($SkipUpdates) {
     Write-Warn "Windows Updates skipped (-SkipUpdates flag)"
 } else {
     Write-Host "  Installing NuGet provider..." -ForegroundColor White
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue | Out-Null
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue
 
     Write-Host "  Installing PSWindowsUpdate module..." -ForegroundColor White
     Install-Module PSWindowsUpdate -Force -Confirm:$false -ErrorAction SilentlyContinue
@@ -120,7 +210,7 @@ if ($SkipUpdates) {
             Write-Host "  Found $($results.Updates.Count) update(s). Installing..." -ForegroundColor White
             $downloader = $session.CreateUpdateDownloader()
             $downloader.Updates = $results.Updates
-            $downloader.Download() | Out-Null
+            $downloader.Download()
 
             $installer = $session.CreateUpdateInstaller()
             $installer.Updates = $results.Updates
@@ -137,9 +227,9 @@ if ($SkipUpdates) {
 }
 
 # =====================================================================
-# STEP 4: ENABLE RDP
+# STEP 5: ENABLE RDP
 # =====================================================================
-Write-Step "4/18" "Enabling Remote Desktop (RDP)"
+Write-Step "5/19" "Enabling Remote Desktop (RDP)"
 
 Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
 Write-OK "RDP enabled"
@@ -151,17 +241,19 @@ Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyConti
 Write-OK "RDP firewall rules enabled"
 
 # =====================================================================
-# STEP 5: WINDOWS OPTIMIZATION
+# STEP 6: WINDOWS OPTIMIZATION
 # =====================================================================
-Write-Step "5/18" "Optimizing Windows Performance"
+Write-Step "6/19" "Optimizing Windows Performance"
 
+Write-Host "  Disabling hibernation..." -ForegroundColor White
 powercfg /h off
 Write-OK "Hibernation disabled"
 
+Write-Host "  Disabling pagefile..." -ForegroundColor White
 try {
     $cs = Get-WmiObject Win32_ComputerSystem
     $cs.AutomaticManagedPagefile = $false
-    $cs.Put() | Out-Null
+    $cs.Put()
 } catch {
     Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name "PagingFiles" -Value ""
 }
@@ -169,9 +261,11 @@ $pf = Get-WmiObject Win32_PageFileSetting -ErrorAction SilentlyContinue
 if ($pf) { $pf.Delete() }
 Write-OK "Pagefile disabled (auto-created per VM)"
 
+Write-Host "  Setting High Performance power plan..." -ForegroundColor White
 powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
 Write-OK "Power plan set to High Performance"
 
+Write-Host "  Disabling unnecessary services..." -ForegroundColor White
 $services = @(
     'DiagTrack',           # Connected User Experiences and Telemetry
     'dmwappushservice',    # WAP Push Message Routing Service
@@ -191,14 +285,17 @@ $services = @(
     'PhoneSvc'             # Phone Service
 )
 foreach ($svc in $services) {
+    Write-Host "    Disabling $svc..." -ForegroundColor Gray
     Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
     Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
 }
 Write-OK "Unnecessary services disabled ($($services.Count) services)"
 
-Get-ScheduledTask -TaskName ServerManager -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+Write-Host "  Disabling Server Manager auto-launch..." -ForegroundColor White
+Get-ScheduledTask -TaskName ServerManager -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue
 Write-OK "Server Manager auto-launch disabled"
 
+Write-Host "  Disabling IE Enhanced Security Configuration..." -ForegroundColor White
 $AdminKey = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}"
 $UserKey = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}"
 Set-ItemProperty -Path $AdminKey -Name "IsInstalled" -Value 0 -ErrorAction SilentlyContinue
@@ -206,12 +303,12 @@ Set-ItemProperty -Path $UserKey -Name "IsInstalled" -Value 0 -ErrorAction Silent
 Write-OK "IE Enhanced Security Configuration disabled"
 
 # =====================================================================
-# STEP 6: DISABLE AUTOMATIC WINDOWS UPDATES
+# STEP 7: DISABLE AUTOMATIC WINDOWS UPDATES
 # =====================================================================
-Write-Step "6/18" "Disabling Automatic Windows Updates (post-template)"
+Write-Step "7/19" "Disabling Automatic Windows Updates (post-template)"
 
 $WUKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
-if (!(Test-Path $WUKey)) { New-Item -Path $WUKey -Force | Out-Null }
+if (!(Test-Path $WUKey)) { New-Item -Path $WUKey -Force }
 Set-ItemProperty -Path $WUKey -Name "NoAutoUpdate" -Value 1
 Set-ItemProperty -Path $WUKey -Name "AUOptions" -Value 2
 Write-OK "Automatic updates disabled (notify only)"
@@ -221,41 +318,47 @@ Set-Service -Name wuauserv -StartupType Manual -ErrorAction SilentlyContinue
 Write-OK "Windows Update service set to manual"
 
 # =====================================================================
-# STEP 7: PASSWORD POLICY
+# STEP 8: PASSWORD POLICY
 # =====================================================================
-Write-Step "7/18" "Configuring Password Policy"
+Write-Step "8/19" "Configuring Password Policy"
 
-net accounts /maxpwage:unlimited 2>&1 | Out-Null
+Write-Host "  Setting maximum password age to unlimited..." -ForegroundColor White
+net accounts /maxpwage:unlimited
 Write-OK "Maximum password age set to unlimited"
 
-net user Administrator /logonpasswordchg:no 2>&1 | Out-Null
+Write-Host "  Disabling Administrator password change at logon..." -ForegroundColor White
+net user Administrator /logonpasswordchg:no
 Write-OK "Administrator password change at logon disabled"
 
-net user Administrator /active:yes 2>&1 | Out-Null
+Write-Host "  Enabling Administrator account..." -ForegroundColor White
+net user Administrator /active:yes
 Write-OK "Administrator account enabled"
 
+Write-Host "  Setting Administrator password to never expire..." -ForegroundColor White
 $admin = [ADSI]"WinNT://./Administrator,user"
 $admin.UserFlags = $admin.UserFlags.Value -bor 0x10000
 $admin.SetInfo()
 Write-OK "Administrator password set to never expire"
 
 # =====================================================================
-# STEP 8: DELETE RECOVERY PARTITION
+# STEP 9: DELETE RECOVERY PARTITION
 # =====================================================================
-Write-Step "8/18" "Deleting Recovery Partition"
+Write-Step "9/19" "Deleting Recovery Partition"
 
 $recoveryFound = $false
 $partitions = Get-Partition -DiskNumber 0 -ErrorAction SilentlyContinue
 foreach ($part in $partitions) {
     if ($part.Type -eq "Recovery") {
         Write-Warn "Found recovery partition: Partition $($part.PartitionNumber), Size: $([math]::Round($part.Size/1MB))MB"
-        reagentc /disable 2>&1 | Out-Null
+        Write-Host "  Disabling Windows Recovery Environment..." -ForegroundColor White
+        reagentc /disable
+        Write-Host "  Deleting recovery partition $($part.PartitionNumber)..." -ForegroundColor White
         $removeScript = @"
 select disk 0
 select partition $($part.PartitionNumber)
 delete partition override
 "@
-        $removeScript | diskpart | Out-Null
+        $removeScript | diskpart
         $recoveryFound = $true
         Write-OK "Recovery partition $($part.PartitionNumber) deleted"
     }
@@ -265,17 +368,19 @@ if (-not $recoveryFound) {
     Write-OK "No recovery partition found (already clean)"
 }
 
-reagentc /disable 2>&1 | Out-Null
+Write-Host "  Disabling Windows Recovery Environment..." -ForegroundColor White
+reagentc /disable
 Write-OK "Windows Recovery Environment disabled"
 
 # =====================================================================
-# STEP 9: EXTEND PRIMARY PARTITION
+# STEP 10: EXTEND PRIMARY PARTITION
 # =====================================================================
-Write-Step "9/18" "Extending Primary Partition"
+Write-Step "10/19" "Extending Primary Partition"
 
 $maxSize = (Get-PartitionSupportedSize -DriveLetter C -ErrorAction SilentlyContinue).SizeMax
 $currentSize = (Get-Partition -DriveLetter C -ErrorAction SilentlyContinue).Size
 if ($maxSize -and $currentSize -and ($maxSize -gt $currentSize)) {
+    Write-Host "  Extending C: drive from $([math]::Round($currentSize/1GB,2))GB to $([math]::Round($maxSize/1GB,2))GB..." -ForegroundColor White
     Resize-Partition -DriveLetter C -Size $maxSize
     Write-OK "C: drive extended to fill available space"
 } else {
@@ -283,9 +388,9 @@ if ($maxSize -and $currentSize -and ($maxSize -gt $currentSize)) {
 }
 
 # =====================================================================
-# STEP 10: INSTALL CLOUDBASE-INIT
+# STEP 11: INSTALL CLOUDBASE-INIT
 # =====================================================================
-Write-Step "10/18" "Installing Cloudbase-Init"
+Write-Step "11/19" "Installing Cloudbase-Init"
 
 $cbInstalled = Test-Path "C:\Program Files\Cloudbase Solutions\Cloudbase-Init"
 if ($cbInstalled) {
@@ -302,20 +407,23 @@ if ($cbInstalled) {
     Start-Process msiexec.exe -ArgumentList "/i $cbPath /qn /norestart" -Wait
     Write-OK "Installed"
 
-    net user cloudbase-init /delete 2>$null
+    Write-Host "  Removing default cloudbase-init user..." -ForegroundColor White
+    net user cloudbase-init /delete
     Write-OK "Removed cloudbase-init service user"
 }
 
-sc.exe config cloudbase-init obj= LocalSystem 2>&1 | Out-Null
+Write-Host "  Setting Cloudbase-Init service to run as LocalSystem..." -ForegroundColor White
+sc.exe config cloudbase-init obj= LocalSystem
 Write-OK "Cloudbase-Init service set to run as LocalSystem"
 
 # =====================================================================
-# STEP 11: CONFIGURE CLOUDBASE-INIT
+# STEP 12: CONFIGURE CLOUDBASE-INIT
 # =====================================================================
-Write-Step "11/18" "Configuring Cloudbase-Init for Proxmox"
+Write-Step "12/19" "Configuring Cloudbase-Init for Proxmox"
 
 $cbConfPath = "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"
 
+Write-Host "  Writing cloudbase-init.conf..." -ForegroundColor White
 @"
 [DEFAULT]
 username=Administrator
@@ -332,6 +440,7 @@ check_latest_version=false
 "@ | Set-Content "$cbConfPath\cloudbase-init.conf" -Force
 Write-OK "Main config written"
 
+Write-Host "  Writing cloudbase-init-unattend.conf..." -ForegroundColor White
 @"
 [DEFAULT]
 username=Administrator
@@ -348,6 +457,7 @@ check_latest_version=false
 "@ | Set-Content "$cbConfPath\cloudbase-init-unattend.conf" -Force
 Write-OK "Unattend config written"
 
+Write-Host "  Writing Unattend.xml..." -ForegroundColor White
 @'
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -390,13 +500,14 @@ Write-OK "Unattend config written"
 Write-OK "Unattend.xml written"
 
 # =====================================================================
-# STEP 12: CREATE PASSWORD INJECTION SCRIPTS
+# STEP 13: CREATE PASSWORD INJECTION SCRIPTS
 # =====================================================================
-Write-Step "12/18" "Creating Password Injection Scripts"
+Write-Step "13/19" "Creating Password Injection Scripts"
 
 $scriptDir = "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\LocalScripts"
-if (!(Test-Path $scriptDir)) { New-Item -Path $scriptDir -ItemType Directory -Force | Out-Null }
+if (!(Test-Path $scriptDir)) { New-Item -Path $scriptDir -ItemType Directory -Force }
 
+Write-Host "  Creating SetPassword.ps1..." -ForegroundColor White
 @'
 # SetPassword - Reads cloud-init config drive and sets Administrator password
 # Supports hidden CD-ROM (no drive letter) via volume label detection
@@ -450,6 +561,7 @@ if ($userData) {
 '@ | Set-Content "$scriptDir\SetPassword.ps1" -Force
 Write-OK "SetPassword.ps1 created (boot-time password injection)"
 
+Write-Host "  Creating PasswordWatcher.ps1..." -ForegroundColor White
 @'
 # PasswordWatcher - Monitors cloud-init drive for password changes in real-time
 # Runs as a persistent background task, checks every 10 seconds
@@ -545,6 +657,7 @@ while ($true) {
 '@ | Set-Content "$scriptDir\PasswordWatcher.ps1" -Force
 Write-OK "PasswordWatcher.ps1 created (real-time password sync every 10s)"
 
+Write-Host "  Creating HideCDROM.ps1..." -ForegroundColor White
 @'
 # Hide cloud-init CD-ROM drive letter at startup
 $vol = Get-WmiObject -Class Win32_Volume | Where-Object { $_.Label -eq "config-2" -or $_.Label -eq "cidata" }
@@ -555,25 +668,27 @@ if ($vol -and $vol.DriveLetter) {
 '@ | Set-Content "$scriptDir\HideCDROM.ps1" -Force
 Write-OK "HideCDROM.ps1 created (hides cloud-init CD-ROM from users)"
 
-# Hide CD-ROM immediately during prep
+Write-Host "  Hiding cloud-init CD-ROM immediately..." -ForegroundColor White
 $vol = Get-WmiObject -Class Win32_Volume | Where-Object { $_.Label -eq "config-2" -or $_.Label -eq "cidata" }
 if ($vol -and $vol.DriveLetter) {
     $vol.DriveLetter = $null
-    $vol.Put() | Out-Null
+    $vol.Put()
     Write-OK "Cloud-init CD-ROM hidden immediately"
 } else {
     Write-OK "Cloud-init CD-ROM already hidden or not present"
 }
 
 # =====================================================================
-# STEP 13: CREATE SCHEDULED TASKS
+# STEP 14: CREATE SCHEDULED TASKS
 # =====================================================================
-Write-Step "13/18" "Creating Scheduled Tasks"
+Write-Step "14/19" "Creating Scheduled Tasks"
 
+Write-Host "  Removing existing tasks..." -ForegroundColor White
 Unregister-ScheduledTask -TaskName "CloudInit-PasswordSync" -Confirm:$false -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName "CloudInit-PasswordWatcher" -Confirm:$false -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName "HideCloudInitCDROM" -Confirm:$false -ErrorAction SilentlyContinue
 
+Write-Host "  Creating PasswordWatcher task..." -ForegroundColor White
 $pwAction = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptDir\PasswordWatcher.ps1`""
 $pwTrigger = New-ScheduledTaskTrigger -AtStartup
@@ -582,233 +697,33 @@ $pwSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfG
     -ExecutionTimeLimit (New-TimeSpan -Days 365)
 $pwPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
 Register-ScheduledTask -TaskName "CloudInit-PasswordWatcher" -Action $pwAction -Trigger $pwTrigger `
-    -Settings $pwSettings -Principal $pwPrincipal -Force | Out-Null
+    -Settings $pwSettings -Principal $pwPrincipal -Force
 Write-OK "PasswordWatcher task registered (persistent, 10s interval)"
 
+Write-Host "  Creating HideCDROM task..." -ForegroundColor White
 $hideAction = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptDir\HideCDROM.ps1`""
 $hideTrigger = New-ScheduledTaskTrigger -AtStartup
 $hideSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 $hidePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
 Register-ScheduledTask -TaskName "HideCloudInitCDROM" -Action $hideAction -Trigger $hideTrigger `
-    -Settings $hideSettings -Principal $hidePrincipal -Force | Out-Null
+    -Settings $hideSettings -Principal $hidePrincipal -Force
 Write-OK "HideCDROM task registered (startup)"
-
-# =====================================================================
-# STEP 14: CLEAN EVENT LOGS
-# =====================================================================
-Write-Step "14/18" "Cleaning Event Logs"
-
-Get-EventLog -LogName * -ErrorAction SilentlyContinue | ForEach-Object {
-    Clear-EventLog -LogName $_.Log -ErrorAction SilentlyContinue
-}
-wevtutil el 2>$null | ForEach-Object {
-    $null = wevtutil cl "$_" 2>&1
-}
-Write-OK "All event logs cleared"
 
 # =====================================================================
 # STEP 15: DEEP DISK CLEANUP
 # =====================================================================
-Write-Step "15/18" "Deep Disk Cleanup"
+Write-Step "15/19" "Deep Disk Cleanup"
 
 $freeBefore = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
 Write-Host "  C: Free space before cleanup: ${freeBefore}GB" -ForegroundColor Gray
 
-# Windows Update - full SoftwareDistribution cleanup
+Write-Host "  Cleaning SoftwareDistribution folder..." -ForegroundColor White
 Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force "C:\Windows\SoftwareDistribution\*" -ErrorAction SilentlyContinue
 Start-Service -Name wuauserv -ErrorAction SilentlyContinue
 Write-OK "SoftwareDistribution fully cleaned"
 
-# Component Store cleanup (WinSxS - biggest space saver)
 Write-Host "  Running DISM Component Store cleanup (this may take a few minutes)..." -ForegroundColor White
-Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1
-Write-OK "Component Store cleaned (WinSxS)"
-
-# Windows Installer cache (orphaned patches)
-Remove-Item -Recurse -Force 'C:\Windows\Installer\$PatchCache$\*' -ErrorAction SilentlyContinue
-Write-OK "Installer patch cache cleaned"
-
-# Windows old/upgrade leftovers
-Remove-Item -Recurse -Force "C:\Windows.old" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Windows\Downloaded Program Files\*" -ErrorAction SilentlyContinue
-Write-OK "Old Windows files cleaned"
-
-# CBS/DISM logs
-Remove-Item -Force "C:\Windows\Logs\CBS\*.log" -ErrorAction SilentlyContinue
-Remove-Item -Force "C:\Windows\Logs\DISM\*.log" -ErrorAction SilentlyContinue
-Write-OK "CBS/DISM logs cleaned"
-
-# Temp folders
-Remove-Item -Recurse -Force "$env:TEMP\*" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Windows\Temp\*" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Temp\*" -ErrorAction SilentlyContinue
-Write-OK "Temp folders cleaned"
-
-# Prefetch
-Remove-Item -Recurse -Force "C:\Windows\Prefetch\*" -ErrorAction SilentlyContinue
-Write-OK "Prefetch cleaned"
-
-# DNS cache
-ipconfig /flushdns 2>&1 | Out-Null
-Write-OK "DNS cache flushed"
-
-# Thumbnail cache
-Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\Explorer\thumbcache_*" -ErrorAction SilentlyContinue
-Write-OK "Thumbnail cache cleaned"
-
-# Recent files
-Remove-Item -Recurse -Force "C:\Users\*\AppData\Roaming\Microsoft\Windows\Recent\*" -ErrorAction SilentlyContinue
-Write-OK "Recent files cleaned"
-
-# Cloudbase-init logs and hash
-Remove-Item -Force "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\*.log" -ErrorAction SilentlyContinue
-Remove-Item -Force "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\.pw_hash" -ErrorAction SilentlyContinue
-Write-OK "Cloudbase-init logs and hash file cleaned"
-
-# Windows Error Reports
-Remove-Item -Recurse -Force "C:\ProgramData\Microsoft\Windows\WER\*" -ErrorAction SilentlyContinue
-Write-OK "Windows Error Reports cleaned"
-
-# Recycle Bin
-Clear-RecycleBin -Force -ErrorAction SilentlyContinue
-Write-OK "Recycle Bin emptied"
-
-# Default IIS folder
-if (Test-Path "C:\inetpub") {
-    Remove-Item -Recurse -Force "C:\inetpub" -ErrorAction SilentlyContinue
-    Write-OK "Default IIS folder (inetpub) removed"
-}
-
-# Additional cleanup (replacing cleanmgr which gets stuck)
-Remove-Item -Recurse -Force "C:\Windows\Downloaded Program Files\*" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\INetCache\*" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\INetCookies\*" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Windows\System32\LogFiles\*" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\ProgramData\Microsoft\Windows Defender\Scans\History\*" -ErrorAction SilentlyContinue
-Remove-Item -Force "C:\Windows\setupact.log" -ErrorAction SilentlyContinue
-Remove-Item -Force "C:\Windows\setuperr.log" -ErrorAction SilentlyContinue
-Remove-Item -Force "C:\Windows\*.log" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "C:\Windows\Minidump\*" -ErrorAction SilentlyContinue
-Remove-Item -Force "C:\Windows\MEMORY.DMP" -ErrorAction SilentlyContinue
-Write-OK "Additional system files cleaned"
-
-$freeAfter = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
-$saved = [math]::Round($freeAfter - $freeBefore, 2)
-Write-Host ""
-Write-Host "  C: Free space after cleanup: ${freeAfter}GB (saved ${saved}GB)" -ForegroundColor Yellow
-
-# =====================================================================
-# STEP 16: REMOVE TEMPLATE PREP SCRIPTS
-# =====================================================================
-Write-Step "16/18" "Removing Template Prep Scripts"
-
-Remove-Item -Force "C:\WinServer-Template-Prep.ps1" -ErrorAction SilentlyContinue
-Remove-Item -Force "C:\WinServer-Template-Prep-v2.ps1" -ErrorAction SilentlyContinue
-Remove-Item -Force "C:\WinServer-Template-Prep-v3.ps1" -ErrorAction SilentlyContinue
-Write-OK "Template prep scripts removed from C:\"
-
-# =====================================================================
-# STEP 17: FINAL VERIFICATION
-# =====================================================================
-Write-Step "17/18" "Final Verification"
-
-Write-Host ""
-Write-Host "  --- SYSTEM ---" -ForegroundColor White
-Write-Host "  OS: $osVersion" -ForegroundColor Gray
-Write-Host "  Hostname: $newHostname (overridden by Cloudbase-init on deploy)" -ForegroundColor Gray
-Write-Host "  Timezone: $($tz.DisplayName)" -ForegroundColor Gray
-Write-Host "  RDP: Enabled (NLA disabled)" -ForegroundColor Gray
-Write-Host "  Power Plan: High Performance" -ForegroundColor Gray
-Write-Host "  Hibernation: Disabled" -ForegroundColor Gray
-Write-Host "  Pagefile: Disabled (auto per VM)" -ForegroundColor Gray
-Write-Host ""
-
-Write-Host "  --- USERS ---" -ForegroundColor White
-$users = net user 2>&1
-Write-Host "  $users" -ForegroundColor Gray
-Write-Host ""
-
-Write-Host "  --- CLOUDBASE-INIT ---" -ForegroundColor White
-Write-Host "  Config: $(Test-Path "$cbConfPath\cloudbase-init.conf")" -ForegroundColor Gray
-Write-Host "  Unattend Config: $(Test-Path "$cbConfPath\cloudbase-init-unattend.conf")" -ForegroundColor Gray
-Write-Host "  Unattend.xml: $(Test-Path "$cbConfPath\Unattend.xml")" -ForegroundColor Gray
-Write-Host "  SetPassword.ps1: $(Test-Path "$scriptDir\SetPassword.ps1")" -ForegroundColor Gray
-Write-Host "  PasswordWatcher.ps1: $(Test-Path "$scriptDir\PasswordWatcher.ps1")" -ForegroundColor Gray
-Write-Host "  HideCDROM.ps1: $(Test-Path "$scriptDir\HideCDROM.ps1")" -ForegroundColor Gray
-Write-Host "  Service Account: LocalSystem" -ForegroundColor Gray
-Write-Host ""
-
-Write-Host "  --- SCHEDULED TASKS ---" -ForegroundColor White
-$watchTask = Get-ScheduledTask -TaskName "CloudInit-PasswordWatcher" -ErrorAction SilentlyContinue
-$hideTask = Get-ScheduledTask -TaskName "HideCloudInitCDROM" -ErrorAction SilentlyContinue
-Write-Host "  PasswordWatcher (10s): $($watchTask.State)" -ForegroundColor Gray
-Write-Host "  HideCDROM (startup): $($hideTask.State)" -ForegroundColor Gray
-Write-Host ""
-
-Write-Host "  --- PASSWORD POLICY ---" -ForegroundColor White
-$maxPwAge = net accounts 2>&1 | Select-String "Maximum password age"
-Write-Host "  $($maxPwAge.ToString().Trim())" -ForegroundColor Gray
-Write-Host ""
-
-Write-Host "  --- PARTITIONS ---" -ForegroundColor White
-Get-Partition -DiskNumber 0 | ForEach-Object {
-    Write-Host "  Partition $($_.PartitionNumber): $($_.Type) - $([math]::Round($_.Size/1GB, 2))GB" -ForegroundColor Gray
-}
-Write-Host ""
-
-Write-Host "  --- DISK USAGE ---" -ForegroundColor White
-$finalFree = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
-$finalUsed = [math]::Round((Get-PSDrive C).Used / 1GB, 2)
-Write-Host "  C: Used: ${finalUsed}GB / Free: ${finalFree}GB" -ForegroundColor Gray
-Write-Host ""
-
-# =====================================================================
-# STEP 18: SYSPREP
-# =====================================================================
-Write-Step "18/18" "Sysprep"
-
-Stop-Transcript
-
-if ($SkipSysprep) {
-    Write-Host ""
-    Write-Host "================================================================" -ForegroundColor Yellow
-    Write-Host "  PREPARATION COMPLETE (Sysprep skipped)" -ForegroundColor Yellow
-    Write-Host "================================================================" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  Run Sysprep manually when ready:" -ForegroundColor White
-    Write-Host '  cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"' -ForegroundColor Cyan
-    Write-Host '  C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml' -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  After VM shuts down, on Proxmox host:" -ForegroundColor White
-    Write-Host "  qm set <VMID> --ide2 local-zfs:cloudinit" -ForegroundColor Cyan
-    Write-Host "  qm set <VMID> --boot c --bootdisk scsi0" -ForegroundColor Cyan
-    Write-Host "  qm template <VMID>" -ForegroundColor Cyan
-    exit
-}
-
-Write-Host ""
-Write-Host "================================================================" -ForegroundColor Yellow
-Write-Host "  PREPARATION COMPLETE!" -ForegroundColor Yellow
-Write-Host "================================================================" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "  The VM will now Sysprep and SHUTDOWN automatically." -ForegroundColor White
-Write-Host ""
-Write-Host "  After VM shuts down, on Proxmox host run:" -ForegroundColor White
-Write-Host "  qm set <VMID> --ide2 local-zfs:cloudinit" -ForegroundColor Cyan
-Write-Host "  qm set <VMID> --boot c --bootdisk scsi0" -ForegroundColor Cyan
-Write-Host "  qm template <VMID>" -ForegroundColor Cyan
-Write-Host ""
-
-$confirmSysprep = Read-Host "Run Sysprep now? (yes/no)"
-if ($confirmSysprep -eq "yes") {
-    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
-    cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"
-    C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml
-} else {
-    Write-Host ""
-    Write-Host "Sysprep skipped. Run manually when ready:" -ForegroundColor Yellow
-    Write-Host '  cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"' -ForegroundColor Cyan
-    Write-Host '  C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml' -ForegroundColor Cyan
-}
+Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase
+Write-OK "Component Store cleaned (
