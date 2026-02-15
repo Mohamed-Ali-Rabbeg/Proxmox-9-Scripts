@@ -49,7 +49,25 @@ else { $osShort = "SVR" }
 
 Write-Host "Detected OS: $osVersion" -ForegroundColor White
 Write-Host ""
+# =====================================================================
+# STEP 0 : INSTALL GOOGLE CHROME
+# =====================================================================
+Write-Step "X/18" "Installing Google Chrome"
 
+$chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+if (Test-Path $chromePath) {
+    Write-Warn "Google Chrome already installed, skipping"
+} else {
+    $chromeUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+    $chromeInstaller = "$env:TEMP\chrome_installer.exe"
+    Write-Host "  Downloading Google Chrome..." -ForegroundColor White
+    Invoke-WebRequest -Uri $chromeUrl -OutFile $chromeInstaller -UseBasicParsing
+    Write-OK "Downloaded"
+    Write-Host "  Installing Google Chrome..." -ForegroundColor White
+    Start-Process $chromeInstaller -ArgumentList "/silent /install" -Wait
+    Remove-Item $chromeInstaller -Force -ErrorAction SilentlyContinue
+    Write-OK "Google Chrome installed"
+}
 # =====================================================================
 # STEP 1: CHECK AND INSTALL VIRTIO DRIVERS + QEMU GUEST AGENT
 # =====================================================================
