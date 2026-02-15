@@ -36,7 +36,7 @@ try {
 Write-Host "================================================================" -ForegroundColor Yellow
 Write-Host "  WINDOWS SERVER TEMPLATE PREPARATION FOR PROXMOX" -ForegroundColor Yellow
 Write-Host "  Cloudbase-Init + Password Injection + Optimization" -ForegroundColor Yellow
-Write-Host "  Version 3.4 - HostStronger" -ForegroundColor Yellow
+Write-Host "  Version: 1.0.5 -Hydra@Rabbeg" -ForegroundColor Yellow
 Write-Host "================================================================" -ForegroundColor Yellow
 Write-Host ""
 
