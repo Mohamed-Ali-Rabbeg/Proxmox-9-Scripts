@@ -2,10 +2,10 @@
 # Windows Server Template Preparation Script for Proxmox + Cloudbase-Init
 # Compatible: Windows Server 2019 / 2022 / 2025 Datacenter
 # Purpose: Prepares a fresh Windows Server install for templating
-# Author: Hydra
+# Author: Hydra RABBEG
 # Version: 1.0.5
 # Usage: Run as Administrator in PowerShell after fresh OS installation
-#        with VirtIO ISO mounted
+#     Note:     VirtIO ISO Should be mounted
 ########################################################################
 
 param(
@@ -26,12 +26,17 @@ function Write-Warn($msg) { Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
 function Write-Err($msg) { Write-Host "  [ERROR] $msg" -ForegroundColor Red }
 
 $logFile = "C:\Windows\Temp\template-prep.log"
-Start-Transcript -Path $logFile -Force
+try {
+    Start-Transcript -Path $logFile -Force -ErrorAction Stop
+    Write-Host "Transcript started, output file is $logFile" -ForegroundColor Green
+} catch {
+    Write-Host "Warning: Could not start transcript: $_" -ForegroundColor Yellow
+}
 
 Write-Host "================================================================" -ForegroundColor Yellow
 Write-Host "  WINDOWS SERVER TEMPLATE PREPARATION FOR PROXMOX" -ForegroundColor Yellow
 Write-Host "  Cloudbase-Init + Password Injection + Optimization" -ForegroundColor Yellow
-Write-Host "  Version 3.3 - HostStronger" -ForegroundColor Yellow
+Write-Host "  Version 3.4 - HostStronger" -ForegroundColor Yellow
 Write-Host "================================================================" -ForegroundColor Yellow
 Write-Host ""
 
@@ -73,7 +78,7 @@ if (-not $virtioDrive) {
     Write-Err "VirtIO ISO not found! Please mount the VirtIO ISO file and try again."
     Write-Host "Available CD/DVD drives:" -ForegroundColor Yellow
     $cdDrives | ForEach-Object { Write-Host "  $($_.Drive) - $($_.VolumeName) (Media loaded: $($_.MediaLoaded))" }
-    Stop-Transcript
+    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
     exit 1
 }
 
@@ -173,18 +178,26 @@ Rename-Computer -NewName $newHostname -Force -ErrorAction SilentlyContinue -Warn
 Write-OK "Hostname set to $newHostname (template default)"
 
 # =====================================================================
-# STEP 4: WINDOWS UPDATES
+# STEP 4: WINDOWS UPDATES (SILENT MODE)
 # =====================================================================
-Write-Step "4/19" "Running Windows Updates"
+Write-Step "4/19" "Running Windows Updates (Silent Mode)"
 
 if ($SkipUpdates) {
     Write-Warn "Windows Updates skipped (-SkipUpdates flag)"
 } else {
     Write-Host "  Installing NuGet provider..." -ForegroundColor White
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue
+    try {
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue | Out-Null
+    } catch {
+        Write-Warn "NuGet installation had non-critical errors, continuing..."
+    }
 
     Write-Host "  Installing PSWindowsUpdate module..." -ForegroundColor White
-    Install-Module PSWindowsUpdate -Force -Confirm:$false -ErrorAction SilentlyContinue
+    try {
+        Install-Module PSWindowsUpdate -Force -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    } catch {
+        Write-Warn "PSWindowsUpdate module installation had non-critical errors, continuing..."
+    }
 
     Write-Host "  Checking for updates (this may take 10-30 minutes)..." -ForegroundColor White
     Write-Host "  Please be patient..." -ForegroundColor Yellow
@@ -194,34 +207,37 @@ if ($SkipUpdates) {
         $updates = Get-WindowsUpdate -AcceptAll -IgnoreReboot -ErrorAction SilentlyContinue
         if ($updates) {
             Write-Host "  Found $($updates.Count) update(s). Installing..." -ForegroundColor White
-            Install-WindowsUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue
+            Install-WindowsUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
             Write-OK "Windows Updates installed ($($updates.Count) updates)"
         } else {
             Write-OK "No updates available - system is up to date"
         }
     } catch {
-        Write-Warn "PSWindowsUpdate module failed, trying built-in method..."
-        $session = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-        Write-Host "  Searching for updates..." -ForegroundColor White
-        $results = $searcher.Search("IsInstalled=0")
+        Write-Warn "PSWindowsUpdate module failed, trying built-in method silently..."
+        try {
+            $session = New-Object -ComObject Microsoft.Update.Session
+            $searcher = $session.CreateUpdateSearcher()
+            $results = $searcher.Search("IsInstalled=0")
 
-        if ($results.Updates.Count -gt 0) {
-            Write-Host "  Found $($results.Updates.Count) update(s). Installing..." -ForegroundColor White
-            $downloader = $session.CreateUpdateDownloader()
-            $downloader.Updates = $results.Updates
-            $downloader.Download()
+            if ($results.Updates.Count -gt 0) {
+                Write-Host "  Found $($results.Updates.Count) update(s). Installing..." -ForegroundColor White
+                $downloader = $session.CreateUpdateDownloader()
+                $downloader.Updates = $results.Updates
+                $downloader.Download() | Out-Null
 
-            $installer = $session.CreateUpdateInstaller()
-            $installer.Updates = $results.Updates
-            $installResult = $installer.Install()
+                $installer = $session.CreateUpdateInstaller()
+                $installer.Updates = $results.Updates
+                $installResult = $installer.Install()
 
-            Write-OK "Windows Updates installed ($($results.Updates.Count) updates)"
-            if ($installResult.RebootRequired) {
-                Write-Warn "Reboot may be required after updates"
+                Write-OK "Windows Updates installed ($($results.Updates.Count) updates)"
+                if ($installResult.RebootRequired) {
+                    Write-Warn "Reboot may be required after updates"
+                }
+            } else {
+                Write-OK "No updates available - system is up to date"
             }
-        } else {
-            Write-OK "No updates available - system is up to date"
+        } catch {
+            Write-Warn "Windows update check failed: $_"
         }
     }
 }
@@ -757,7 +773,32 @@ ipconfig /flushdns
 Write-OK "DNS cache flushed"
 
 Write-Host "  Cleaning thumbnail cache..." -ForegroundColor White
-Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\Explorer\thumbcache_*" -ErrorAction SilentlyContinue
+try {
+    # Try to stop Explorer to release file locks
+    Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    
+    $thumbCachePaths = @(
+        "C:\Users\*\AppData\Local\Microsoft\Windows\Explorer\thumbcache_*",
+        "C:\Users\*\AppData\Local\Microsoft\Windows\Explorer\*.db"
+    )
+    
+    foreach ($path in $thumbCachePaths) {
+        Get-ChildItem $path -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                Remove-Item -Force $_.FullName -ErrorAction SilentlyContinue
+            } catch {
+                # Skip files that can't be deleted
+                Write-Host "      (Skipped: $($_.Name) - in use)" -ForegroundColor DarkGray
+            }
+        }
+    }
+    
+    # Restart Explorer
+    Start-Process "explorer.exe" -WindowStyle Hidden
+} catch {
+    Write-Warn "Some thumbnail cache files could not be deleted (they're in use)"
+}
 Write-OK "Thumbnail cache cleaned"
 
 Write-Host "  Cleaning recent files..." -ForegroundColor White
@@ -812,7 +853,7 @@ Remove-Item -Force "C:\WinServer-Template-Prep-v3.ps1" -ErrorAction SilentlyCont
 Write-OK "Template prep scripts removed from C:\"
 
 # =====================================================================
-# STEP 17: CLEAN ALL EVENT LOGS AND POWERSHELL HISTORY (NOW JUST BEFORE SYSPREP)
+# STEP 17: CLEAN ALL EVENT LOGS AND POWERSHELL HISTORY (SILENT MODE)
 # =====================================================================
 Write-Step "17/19" "Cleaning All Event Logs and PowerShell History (Silent Mode)"
 
@@ -1000,23 +1041,6 @@ try {
     $errorMessages += "Error cleaning EVTX files: $_"
 }
 
-# Final verification (silent) - just check if critical logs are accessible
-try {
-    $verificationLogs = @("Application", "System", "Security")
-    $accessibleCount = 0
-    
-    foreach ($log in $verificationLogs) {
-        try {
-            $null = wevtutil qe "$log" /f:text /c:1 2>$null
-            $accessibleCount++
-        } catch {
-            # Log might be being recreated
-        }
-    }
-} catch {
-    # Ignore verification errors
-}
-
 # Display summary
 if ($errorCount -eq 0) {
     Write-OK "All event logs and PowerShell history cleared successfully"
@@ -1096,7 +1120,14 @@ Write-Host ""
 # =====================================================================
 Write-Step "19/19" "Sysprep"
 
-Stop-Transcript
+try {
+    Stop-Transcript -ErrorAction SilentlyContinue
+} catch {
+    # Transcript wasn't started or already stopped - ignore
+}
+
+# Clear current PowerShell session history
+Clear-History
 
 if ($SkipSysprep) {
     Write-Host ""
@@ -1112,6 +1143,9 @@ if ($SkipSysprep) {
     Write-Host "  qm set <VMID> --ide2 local-zfs:cloudinit" -ForegroundColor Cyan
     Write-Host "  qm set <VMID> --boot c --bootdisk scsi0" -ForegroundColor Cyan
     Write-Host "  qm template <VMID>" -ForegroundColor Cyan
+    
+    # Clear history one more time before exiting
+    Clear-History
     exit
 }
 
@@ -1132,10 +1166,17 @@ $confirmSysprep = Read-Host "Run Sysprep now? (yes/no)"
 if ($confirmSysprep -eq "yes") {
     Remove-Item $logFile -Force -ErrorAction SilentlyContinue
     cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"
+    
+    # Clear history before Sysprep
+    Clear-History
+    
     C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml
 } else {
     Write-Host ""
     Write-Host "Sysprep skipped. Run manually when ready:" -ForegroundColor Yellow
     Write-Host '  cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"' -ForegroundColor Cyan
     Write-Host '  C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml' -ForegroundColor Cyan
+    
+    # Clear history before exiting
+    Clear-History
 }
