@@ -623,7 +623,7 @@ Write-OK "SoftwareDistribution fully cleaned"
 
 # Component Store cleanup (WinSxS - biggest space saver)
 Write-Host "  Running DISM Component Store cleanup (this may take a few minutes)..." -ForegroundColor White
-Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1 | Out-Null
+Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1
 Write-OK "Component Store cleaned (WinSxS)"
 
 # Windows Installer cache (orphaned patches)
