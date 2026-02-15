@@ -2,8 +2,8 @@
 # Windows Server Template Preparation Script for Proxmox + Cloudbase-Init
 # Compatible: Windows Server 2019 / 2022 / 2025 Datacenter
 # Purpose: Prepares a fresh Windows Server install for templating
-# Author: Hydra (Mohamed Ali RABBEG)
-# Version: 1.0.3
+# Author: Hydra
+# Version: 1.0.4
 # Usage: Run as Administrator in PowerShell after fresh OS installation
 #        with VirtIO ISO mounted
 ########################################################################
@@ -726,4 +726,211 @@ Write-OK "SoftwareDistribution fully cleaned"
 
 Write-Host "  Running DISM Component Store cleanup (this may take a few minutes)..." -ForegroundColor White
 Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase
-Write-OK "Component Store cleaned"
+Write-OK "Component Store cleaned (WinSxS)"
+
+Write-Host "  Cleaning Windows Installer patch cache..." -ForegroundColor White
+Remove-Item -Recurse -Force 'C:\Windows\Installer\$PatchCache$\*' -ErrorAction SilentlyContinue
+Write-OK "Installer patch cache cleaned"
+
+Write-Host "  Removing Windows old/upgrade leftovers..." -ForegroundColor White
+Remove-Item -Recurse -Force "C:\Windows.old" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\Downloaded Program Files\*" -ErrorAction SilentlyContinue
+Write-OK "Old Windows files cleaned"
+
+Write-Host "  Cleaning CBS/DISM logs..." -ForegroundColor White
+Remove-Item -Force "C:\Windows\Logs\CBS\*.log" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\Logs\DISM\*.log" -ErrorAction SilentlyContinue
+Write-OK "CBS/DISM logs cleaned"
+
+Write-Host "  Cleaning Temp folders..." -ForegroundColor White
+Remove-Item -Recurse -Force "$env:TEMP\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\Temp\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Temp\*" -ErrorAction SilentlyContinue
+Write-OK "Temp folders cleaned"
+
+Write-Host "  Cleaning Prefetch..." -ForegroundColor White
+Remove-Item -Recurse -Force "C:\Windows\Prefetch\*" -ErrorAction SilentlyContinue
+Write-OK "Prefetch cleaned"
+
+Write-Host "  Flushing DNS cache..." -ForegroundColor White
+ipconfig /flushdns
+Write-OK "DNS cache flushed"
+
+Write-Host "  Cleaning thumbnail cache..." -ForegroundColor White
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\Explorer\thumbcache_*" -ErrorAction SilentlyContinue
+Write-OK "Thumbnail cache cleaned"
+
+Write-Host "  Cleaning recent files..." -ForegroundColor White
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Roaming\Microsoft\Windows\Recent\*" -ErrorAction SilentlyContinue
+Write-OK "Recent files cleaned"
+
+Write-Host "  Cleaning Cloudbase-init logs and hash file..." -ForegroundColor White
+Remove-Item -Force "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\*.log" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\.pw_hash" -ErrorAction SilentlyContinue
+Write-OK "Cloudbase-init logs and hash file cleaned"
+
+Write-Host "  Cleaning Windows Error Reports..." -ForegroundColor White
+Remove-Item -Recurse -Force "C:\ProgramData\Microsoft\Windows\WER\*" -ErrorAction SilentlyContinue
+Write-OK "Windows Error Reports cleaned"
+
+Write-Host "  Emptying Recycle Bin..." -ForegroundColor White
+Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+Write-OK "Recycle Bin emptied"
+
+Write-Host "  Removing default IIS folder..." -ForegroundColor White
+if (Test-Path "C:\inetpub") {
+    Remove-Item -Recurse -Force "C:\inetpub" -ErrorAction SilentlyContinue
+    Write-OK "Default IIS folder (inetpub) removed"
+}
+
+Write-Host "  Cleaning additional system files..." -ForegroundColor White
+Remove-Item -Recurse -Force "C:\Windows\Downloaded Program Files\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\INetCache\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\INetCookies\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\System32\LogFiles\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\ProgramData\Microsoft\Windows Defender\Scans\History\*" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\setupact.log" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\setuperr.log" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\*.log" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\Minidump\*" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\MEMORY.DMP" -ErrorAction SilentlyContinue
+Write-OK "Additional system files cleaned"
+
+$freeAfter = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+$saved = [math]::Round($freeAfter - $freeBefore, 2)
+Write-Host ""
+Write-Host "  C: Free space after cleanup: ${freeAfter}GB (saved ${saved}GB)" -ForegroundColor Yellow
+
+# =====================================================================
+# STEP 16: REMOVE TEMPLATE PREP SCRIPTS
+# =====================================================================
+Write-Step "16/19" "Removing Template Prep Scripts"
+
+Remove-Item -Force "C:\WinServer-Template-Prep.ps1" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\WinServer-Template-Prep-v2.ps1" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\WinServer-Template-Prep-v3.ps1" -ErrorAction SilentlyContinue
+Write-OK "Template prep scripts removed from C:\"
+
+# =====================================================================
+# STEP 17: CLEAN EVENT LOGS (NOW JUST BEFORE SYSPREP)
+# =====================================================================
+Write-Step "17/19" "Cleaning Event Logs"
+
+Write-Host "  Clearing all event logs..." -ForegroundColor White
+Get-EventLog -LogName * -ErrorAction SilentlyContinue | ForEach-Object {
+    Write-Host "    Clearing $($_.Log) log..." -ForegroundColor Gray
+    Clear-EventLog -LogName $_.Log -ErrorAction SilentlyContinue
+}
+
+Write-Host "  Clearing Windows event logs via wevtutil..." -ForegroundColor White
+wevtutil el 2>$null | ForEach-Object {
+    Write-Host "    Clearing $_ log..." -ForegroundColor Gray
+    $null = wevtutil cl "$_" 2>&1
+}
+Write-OK "All event logs cleared"
+
+# =====================================================================
+# STEP 18: FINAL VERIFICATION
+# =====================================================================
+Write-Step "18/19" "Final Verification"
+
+Write-Host ""
+Write-Host "  --- SYSTEM ---" -ForegroundColor White
+Write-Host "  OS: $osVersion" -ForegroundColor Gray
+Write-Host "  QEMU Guest Agent: $(if (Get-Service -Name 'QEMU-GA' -ErrorAction SilentlyContinue) { 'Installed' } else { 'Not Found' })" -ForegroundColor Gray
+Write-Host "  VirtIO Drivers: Installed" -ForegroundColor Gray
+Write-Host "  Hostname: $newHostname (overridden by Cloudbase-init on deploy)" -ForegroundColor Gray
+Write-Host "  Timezone: $($tz.DisplayName)" -ForegroundColor Gray
+Write-Host "  RDP: Enabled (NLA disabled)" -ForegroundColor Gray
+Write-Host "  Power Plan: High Performance" -ForegroundColor Gray
+Write-Host "  Hibernation: Disabled" -ForegroundColor Gray
+Write-Host "  Pagefile: Disabled (auto per VM)" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- USERS ---" -ForegroundColor White
+$users = net user 2>&1
+Write-Host "  $users" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- CLOUDBASE-INIT ---" -ForegroundColor White
+Write-Host "  Config: $(Test-Path "$cbConfPath\cloudbase-init.conf")" -ForegroundColor Gray
+Write-Host "  Unattend Config: $(Test-Path "$cbConfPath\cloudbase-init-unattend.conf")" -ForegroundColor Gray
+Write-Host "  Unattend.xml: $(Test-Path "$cbConfPath\Unattend.xml")" -ForegroundColor Gray
+Write-Host "  SetPassword.ps1: $(Test-Path "$scriptDir\SetPassword.ps1")" -ForegroundColor Gray
+Write-Host "  PasswordWatcher.ps1: $(Test-Path "$scriptDir\PasswordWatcher.ps1")" -ForegroundColor Gray
+Write-Host "  HideCDROM.ps1: $(Test-Path "$scriptDir\HideCDROM.ps1")" -ForegroundColor Gray
+Write-Host "  Service Account: LocalSystem" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- SCHEDULED TASKS ---" -ForegroundColor White
+$watchTask = Get-ScheduledTask -TaskName "CloudInit-PasswordWatcher" -ErrorAction SilentlyContinue
+$hideTask = Get-ScheduledTask -TaskName "HideCloudInitCDROM" -ErrorAction SilentlyContinue
+Write-Host "  PasswordWatcher (10s): $($watchTask.State)" -ForegroundColor Gray
+Write-Host "  HideCDROM (startup): $($hideTask.State)" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- PASSWORD POLICY ---" -ForegroundColor White
+$maxPwAge = net accounts 2>&1 | Select-String "Maximum password age"
+Write-Host "  $($maxPwAge.ToString().Trim())" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- PARTITIONS ---" -ForegroundColor White
+Get-Partition -DiskNumber 0 | ForEach-Object {
+    Write-Host "  Partition $($_.PartitionNumber): $($_.Type) - $([math]::Round($_.Size/1GB, 2))GB" -ForegroundColor Gray
+}
+Write-Host ""
+
+Write-Host "  --- DISK USAGE ---" -ForegroundColor White
+$finalFree = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+$finalUsed = [math]::Round((Get-PSDrive C).Used / 1GB, 2)
+Write-Host "  C: Used: ${finalUsed}GB / Free: ${finalFree}GB" -ForegroundColor Gray
+Write-Host ""
+
+# =====================================================================
+# STEP 19: SYSPREP
+# =====================================================================
+Write-Step "19/19" "Sysprep"
+
+Stop-Transcript
+
+if ($SkipSysprep) {
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Yellow
+    Write-Host "  PREPARATION COMPLETE (Sysprep skipped)" -ForegroundColor Yellow
+    Write-Host "================================================================" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Run Sysprep manually when ready:" -ForegroundColor White
+    Write-Host '  cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"' -ForegroundColor Cyan
+    Write-Host '  C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml' -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  After VM shuts down, on Proxmox host:" -ForegroundColor White
+    Write-Host "  qm set <VMID> --ide2 local-zfs:cloudinit" -ForegroundColor Cyan
+    Write-Host "  qm set <VMID> --boot c --bootdisk scsi0" -ForegroundColor Cyan
+    Write-Host "  qm template <VMID>" -ForegroundColor Cyan
+    exit
+}
+
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Yellow
+Write-Host "  PREPARATION COMPLETE!" -ForegroundColor Yellow
+Write-Host "================================================================" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  The VM will now Sysprep and SHUTDOWN automatically." -ForegroundColor White
+Write-Host ""
+Write-Host "  After VM shuts down, on Proxmox host run:" -ForegroundColor White
+Write-Host "  qm set <VMID> --ide2 local-zfs:cloudinit" -ForegroundColor Cyan
+Write-Host "  qm set <VMID> --boot c --bootdisk scsi0" -ForegroundColor Cyan
+Write-Host "  qm template <VMID>" -ForegroundColor Cyan
+Write-Host ""
+
+$confirmSysprep = Read-Host "Run Sysprep now? (yes/no)"
+if ($confirmSysprep -eq "yes") {
+    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+    cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"
+    C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml
+} else {
+    Write-Host ""
+    Write-Host "Sysprep skipped. Run manually when ready:" -ForegroundColor Yellow
+    Write-Host '  cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"' -ForegroundColor Cyan
+    Write-Host '  C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml' -ForegroundColor Cyan
+}
