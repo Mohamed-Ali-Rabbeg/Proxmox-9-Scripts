@@ -1,0 +1,814 @@
+########################################################################
+# Windows Server Template Preparation Script for Proxmox + Cloudbase-Init
+# Compatible: Windows Server 2019 / 2022 / 2025 Datacenter
+# Purpose: Prepares a fresh Windows Server install for templating
+# Author: HostStronger Infrastructure Team
+# Version: 3.1
+# Usage: Run as Administrator in PowerShell after fresh OS installation
+#        with VirtIO drivers and QEMU Guest Agent already installed
+########################################################################
+
+param(
+    [switch]$SkipSysprep,
+    [switch]$SkipUpdates,
+    [switch]$Force
+)
+
+$ErrorActionPreference = "Continue"
+$ProgressPreference = "SilentlyContinue"
+
+# =====================================================================
+# COLORS AND LOGGING
+# =====================================================================
+function Write-Step($step, $msg) { Write-Host "`n[$step] $msg" -ForegroundColor Cyan }
+function Write-OK($msg) { Write-Host "  [OK] $msg" -ForegroundColor Green }
+function Write-Warn($msg) { Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
+function Write-Err($msg) { Write-Host "  [ERROR] $msg" -ForegroundColor Red }
+
+$logFile = "C:\Windows\Temp\template-prep.log"
+Start-Transcript -Path $logFile -Force
+
+Write-Host "================================================================" -ForegroundColor Yellow
+Write-Host "  WINDOWS SERVER TEMPLATE PREPARATION FOR PROXMOX" -ForegroundColor Yellow
+Write-Host "  Cloudbase-Init + Password Injection + Optimization" -ForegroundColor Yellow
+Write-Host "  Version 3.1 - HostStronger" -ForegroundColor Yellow
+Write-Host "================================================================" -ForegroundColor Yellow
+Write-Host ""
+
+$osVersion = (Get-WmiObject Win32_OperatingSystem).Caption
+$osShort = ""
+if ($osVersion -match "2019") { $osShort = "2K19" }
+elseif ($osVersion -match "2022") { $osShort = "2K22" }
+elseif ($osVersion -match "2025") { $osShort = "2K25" }
+else { $osShort = "SVR" }
+
+Write-Host "Detected OS: $osVersion" -ForegroundColor White
+Write-Host ""
+
+if (-not $Force) {
+    $confirm = Read-Host "This will prepare this VM for templating. Continue? (yes/no)"
+    if ($confirm -ne "yes") {
+        Write-Host "Aborted." -ForegroundColor Red
+        Stop-Transcript
+        exit
+    }
+}
+
+# =====================================================================
+# STEP 1: SET TIMEZONE TO PARIS (UTC+1)
+# =====================================================================
+Write-Step "1/18" "Setting Timezone to Paris (Romance Standard Time / UTC+1)"
+
+Set-TimeZone -Id "Romance Standard Time"
+$tz = Get-TimeZone
+Write-OK "Timezone set to: $($tz.DisplayName)"
+
+w32tm /config /manualpeerlist:"time.windows.com,0x1 pool.ntp.org,0x1" /syncfromflags:manual /reliable:yes /update 2>&1 | Out-Null
+Restart-Service w32time -ErrorAction SilentlyContinue
+w32tm /resync /force 2>&1 | Out-Null
+Write-OK "NTP time sync configured"
+
+# =====================================================================
+# STEP 2: SET PROFESSIONAL HOSTNAME
+# =====================================================================
+Write-Step "2/18" "Setting Professional Hostname"
+
+$randomSuffix = -join ((65..90) + (48..57) | Get-Random -Count 5 | ForEach-Object { [char]$_ })
+$newHostname = "WIN-$osShort-$randomSuffix"
+Write-Host "  Current hostname: $env:COMPUTERNAME" -ForegroundColor Gray
+Write-Host "  New hostname: $newHostname" -ForegroundColor White
+Write-Warn "Note: Hostname will be overridden by Cloudbase-init on clone deployment"
+
+Rename-Computer -NewName $newHostname -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+Write-OK "Hostname set to $newHostname (template default)"
+
+# =====================================================================
+# STEP 3: WINDOWS UPDATES
+# =====================================================================
+Write-Step "3/18" "Running Windows Updates"
+
+if ($SkipUpdates) {
+    Write-Warn "Windows Updates skipped (-SkipUpdates flag)"
+} else {
+    Write-Host "  Installing NuGet provider..." -ForegroundColor White
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue | Out-Null
+
+    Write-Host "  Installing PSWindowsUpdate module..." -ForegroundColor White
+    Install-Module PSWindowsUpdate -Force -Confirm:$false -ErrorAction SilentlyContinue
+
+    Write-Host "  Checking for updates (this may take 10-30 minutes)..." -ForegroundColor White
+    Write-Host "  Please be patient..." -ForegroundColor Yellow
+
+    try {
+        Import-Module PSWindowsUpdate -ErrorAction Stop
+        $updates = Get-WindowsUpdate -AcceptAll -IgnoreReboot -ErrorAction SilentlyContinue
+        if ($updates) {
+            Write-Host "  Found $($updates.Count) update(s). Installing..." -ForegroundColor White
+            Install-WindowsUpdate -AcceptAll -IgnoreReboot -Confirm:$false -ErrorAction SilentlyContinue
+            Write-OK "Windows Updates installed ($($updates.Count) updates)"
+        } else {
+            Write-OK "No updates available - system is up to date"
+        }
+    } catch {
+        Write-Warn "PSWindowsUpdate module failed, trying built-in method..."
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        Write-Host "  Searching for updates..." -ForegroundColor White
+        $results = $searcher.Search("IsInstalled=0")
+
+        if ($results.Updates.Count -gt 0) {
+            Write-Host "  Found $($results.Updates.Count) update(s). Installing..." -ForegroundColor White
+            $downloader = $session.CreateUpdateDownloader()
+            $downloader.Updates = $results.Updates
+            $downloader.Download() | Out-Null
+
+            $installer = $session.CreateUpdateInstaller()
+            $installer.Updates = $results.Updates
+            $installResult = $installer.Install()
+
+            Write-OK "Windows Updates installed ($($results.Updates.Count) updates)"
+            if ($installResult.RebootRequired) {
+                Write-Warn "Reboot may be required after updates"
+            }
+        } else {
+            Write-OK "No updates available - system is up to date"
+        }
+    }
+}
+
+# =====================================================================
+# STEP 4: ENABLE RDP
+# =====================================================================
+Write-Step "4/18" "Enabling Remote Desktop (RDP)"
+
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+Write-OK "RDP enabled"
+
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+Write-OK "NLA disabled (RDP works without console pre-login)"
+
+Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+Write-OK "RDP firewall rules enabled"
+
+# =====================================================================
+# STEP 5: WINDOWS OPTIMIZATION
+# =====================================================================
+Write-Step "5/18" "Optimizing Windows Performance"
+
+powercfg /h off
+Write-OK "Hibernation disabled"
+
+try {
+    $cs = Get-WmiObject Win32_ComputerSystem
+    $cs.AutomaticManagedPagefile = $false
+    $cs.Put() | Out-Null
+} catch {
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name "PagingFiles" -Value ""
+}
+$pf = Get-WmiObject Win32_PageFileSetting -ErrorAction SilentlyContinue
+if ($pf) { $pf.Delete() }
+Write-OK "Pagefile disabled (auto-created per VM)"
+
+powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+Write-OK "Power plan set to High Performance"
+
+$services = @(
+    'DiagTrack',           # Connected User Experiences and Telemetry
+    'dmwappushservice',    # WAP Push Message Routing Service
+    'WSearch',             # Windows Search
+    'SysMain',             # Superfetch
+    'MapsBroker',          # Downloaded Maps Manager
+    'lfsvc',               # Geolocation Service
+    'RetailDemo',          # Retail Demo Service
+    'WerSvc',              # Windows Error Reporting
+    'Fax',                 # Fax Service
+    'XblAuthManager',      # Xbox Live Auth Manager
+    'XblGameSave',         # Xbox Live Game Save
+    'XboxNetApiSvc',       # Xbox Live Networking Service
+    'wisvc',               # Windows Insider Service
+    'icssvc',              # Windows Mobile Hotspot Service
+    'WMPNetworkSvc',       # Windows Media Player Network Sharing
+    'PhoneSvc'             # Phone Service
+)
+foreach ($svc in $services) {
+    Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+    Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+}
+Write-OK "Unnecessary services disabled ($($services.Count) services)"
+
+Get-ScheduledTask -TaskName ServerManager -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+Write-OK "Server Manager auto-launch disabled"
+
+$AdminKey = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}"
+$UserKey = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}"
+Set-ItemProperty -Path $AdminKey -Name "IsInstalled" -Value 0 -ErrorAction SilentlyContinue
+Set-ItemProperty -Path $UserKey -Name "IsInstalled" -Value 0 -ErrorAction SilentlyContinue
+Write-OK "IE Enhanced Security Configuration disabled"
+
+# =====================================================================
+# STEP 6: DISABLE AUTOMATIC WINDOWS UPDATES
+# =====================================================================
+Write-Step "6/18" "Disabling Automatic Windows Updates (post-template)"
+
+$WUKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+if (!(Test-Path $WUKey)) { New-Item -Path $WUKey -Force | Out-Null }
+Set-ItemProperty -Path $WUKey -Name "NoAutoUpdate" -Value 1
+Set-ItemProperty -Path $WUKey -Name "AUOptions" -Value 2
+Write-OK "Automatic updates disabled (notify only)"
+
+Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+Set-Service -Name wuauserv -StartupType Manual -ErrorAction SilentlyContinue
+Write-OK "Windows Update service set to manual"
+
+# =====================================================================
+# STEP 7: PASSWORD POLICY
+# =====================================================================
+Write-Step "7/18" "Configuring Password Policy"
+
+net accounts /maxpwage:unlimited 2>&1 | Out-Null
+Write-OK "Maximum password age set to unlimited"
+
+net user Administrator /logonpasswordchg:no 2>&1 | Out-Null
+Write-OK "Administrator password change at logon disabled"
+
+net user Administrator /active:yes 2>&1 | Out-Null
+Write-OK "Administrator account enabled"
+
+$admin = [ADSI]"WinNT://./Administrator,user"
+$admin.UserFlags = $admin.UserFlags.Value -bor 0x10000
+$admin.SetInfo()
+Write-OK "Administrator password set to never expire"
+
+# =====================================================================
+# STEP 8: DELETE RECOVERY PARTITION
+# =====================================================================
+Write-Step "8/18" "Deleting Recovery Partition"
+
+$recoveryFound = $false
+$partitions = Get-Partition -DiskNumber 0 -ErrorAction SilentlyContinue
+foreach ($part in $partitions) {
+    if ($part.Type -eq "Recovery") {
+        Write-Warn "Found recovery partition: Partition $($part.PartitionNumber), Size: $([math]::Round($part.Size/1MB))MB"
+        reagentc /disable 2>&1 | Out-Null
+        $removeScript = @"
+select disk 0
+select partition $($part.PartitionNumber)
+delete partition override
+"@
+        $removeScript | diskpart | Out-Null
+        $recoveryFound = $true
+        Write-OK "Recovery partition $($part.PartitionNumber) deleted"
+    }
+}
+
+if (-not $recoveryFound) {
+    Write-OK "No recovery partition found (already clean)"
+}
+
+reagentc /disable 2>&1 | Out-Null
+Write-OK "Windows Recovery Environment disabled"
+
+# =====================================================================
+# STEP 9: EXTEND PRIMARY PARTITION
+# =====================================================================
+Write-Step "9/18" "Extending Primary Partition"
+
+$maxSize = (Get-PartitionSupportedSize -DriveLetter C -ErrorAction SilentlyContinue).SizeMax
+$currentSize = (Get-Partition -DriveLetter C -ErrorAction SilentlyContinue).Size
+if ($maxSize -and $currentSize -and ($maxSize -gt $currentSize)) {
+    Resize-Partition -DriveLetter C -Size $maxSize
+    Write-OK "C: drive extended to fill available space"
+} else {
+    Write-OK "C: drive already at maximum size"
+}
+
+# =====================================================================
+# STEP 10: INSTALL CLOUDBASE-INIT
+# =====================================================================
+Write-Step "10/18" "Installing Cloudbase-Init"
+
+$cbInstalled = Test-Path "C:\Program Files\Cloudbase Solutions\Cloudbase-Init"
+if ($cbInstalled) {
+    Write-Warn "Cloudbase-Init already installed, skipping download"
+} else {
+    $cbUrl = "https://cloudbase.it/downloads/CloudbaseInitSetup_Stable_x64.msi"
+    $cbPath = "$env:TEMP\CloudbaseInitSetup.msi"
+
+    Write-Host "  Downloading Cloudbase-Init..." -ForegroundColor White
+    Invoke-WebRequest -Uri $cbUrl -OutFile $cbPath -UseBasicParsing
+    Write-OK "Downloaded"
+
+    Write-Host "  Installing Cloudbase-Init..." -ForegroundColor White
+    Start-Process msiexec.exe -ArgumentList "/i $cbPath /qn /norestart" -Wait
+    Write-OK "Installed"
+
+    net user cloudbase-init /delete 2>$null
+    Write-OK "Removed cloudbase-init service user"
+}
+
+sc.exe config cloudbase-init obj= LocalSystem 2>&1 | Out-Null
+Write-OK "Cloudbase-Init service set to run as LocalSystem"
+
+# =====================================================================
+# STEP 11: CONFIGURE CLOUDBASE-INIT
+# =====================================================================
+Write-Step "11/18" "Configuring Cloudbase-Init for Proxmox"
+
+$cbConfPath = "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"
+
+@"
+[DEFAULT]
+username=Administrator
+inject_user_password=true
+first_logon_behaviour=no
+password_expires=false
+metadata_services=cloudbaseinit.metadata.services.configdrive.ConfigDriveService
+plugins=cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin,cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,cloudbaseinit.plugins.windows.extendvolumes.ExtendVolumesPlugin,cloudbaseinit.plugins.common.localscripts.LocalScriptsPlugin
+allow_reboot=false
+stop_service_on_exit=false
+log_dir=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\
+log_file=cloudbase-init.log
+check_latest_version=false
+"@ | Set-Content "$cbConfPath\cloudbase-init.conf" -Force
+Write-OK "Main config written"
+
+@"
+[DEFAULT]
+username=Administrator
+inject_user_password=true
+first_logon_behaviour=no
+password_expires=false
+metadata_services=cloudbaseinit.metadata.services.configdrive.ConfigDriveService
+plugins=cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin,cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,cloudbaseinit.plugins.windows.extendvolumes.ExtendVolumesPlugin
+allow_reboot=false
+stop_service_on_exit=false
+log_dir=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\
+log_file=cloudbase-init-unattend.log
+check_latest_version=false
+"@ | Set-Content "$cbConfPath\cloudbase-init-unattend.conf" -Force
+Write-OK "Unattend config written"
+
+@'
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="generalize">
+    <component name="Microsoft-Windows-PnpSysprep" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>1</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value></Value>
+          <PlainText>true</PlainText>
+        </AdministratorPassword>
+      </UserAccounts>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Order>1</Order>
+          <Path>cmd.exe /c ""C:\Program Files\Cloudbase Solutions\Cloudbase-Init\Python\Scripts\cloudbase-init.exe" --config-file "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init-unattend.conf" &amp;&amp; exit 1 || exit 2"</Path>
+          <Description>Run Cloudbase-Init</Description>
+          <WillReboot>OnRequest</WillReboot>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+</unattend>
+'@ | Set-Content "$cbConfPath\Unattend.xml" -Encoding UTF8 -Force
+Write-OK "Unattend.xml written"
+
+# =====================================================================
+# STEP 12: CREATE PASSWORD INJECTION SCRIPTS
+# =====================================================================
+Write-Step "12/18" "Creating Password Injection Scripts"
+
+$scriptDir = "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\LocalScripts"
+if (!(Test-Path $scriptDir)) { New-Item -Path $scriptDir -ItemType Directory -Force | Out-Null }
+
+@'
+# SetPassword - Reads cloud-init config drive and sets Administrator password
+# Supports hidden CD-ROM (no drive letter) via volume label detection
+$userData = $null
+
+# Method 1: Check all lettered drives
+Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+    $paths = @(
+        "$($_.Root)user-data",
+        "$($_.Root)openstack\latest\user_data"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) {
+            $userData = Get-Content $p -Raw
+            break
+        }
+    }
+}
+
+# Method 2: Find by volume label if not found above (hidden CD-ROM)
+if (-not $userData) {
+    $vol = Get-WmiObject -Class Win32_Volume | Where-Object { $_.Label -eq "config-2" -or $_.Label -eq "cidata" }
+    if ($vol) {
+        $mountPoint = $vol.DeviceID
+        $paths = @(
+            "${mountPoint}user-data",
+            "${mountPoint}openstack\latest\user_data"
+        )
+        foreach ($p in $paths) {
+            if (Test-Path $p) {
+                $userData = Get-Content $p -Raw
+                break
+            }
+        }
+    }
+}
+
+if ($userData) {
+    if ($userData -match "password:\s*(.+)") {
+        $password = $Matches[1].Trim()
+        $username = "Administrator"
+        if ($userData -match "user:\s*(.+)") {
+            $username = $Matches[1].Trim()
+        }
+        net user $username "$password"
+        $user = [ADSI]"WinNT://./$username,user"
+        $user.UserFlags = $user.UserFlags.Value -bor 0x10000
+        $user.SetInfo()
+    }
+}
+'@ | Set-Content "$scriptDir\SetPassword.ps1" -Force
+Write-OK "SetPassword.ps1 created (boot-time password injection)"
+
+@'
+# PasswordWatcher - Monitors cloud-init drive for password changes in real-time
+# Runs as a persistent background task, checks every 10 seconds
+# Hash comparison ensures near-zero CPU usage
+$logFile = "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\password-sync.log"
+
+function Write-Log($msg) {
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $msg" | Out-File $logFile -Append
+}
+
+function Get-CloudInitUserData {
+    $userData = $null
+
+    # Method 1: Lettered drives
+    Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+        $paths = @(
+            "$($_.Root)user-data",
+            "$($_.Root)openstack\latest\user_data"
+        )
+        foreach ($p in $paths) {
+            if (Test-Path $p) {
+                $userData = Get-Content $p -Raw
+                break
+            }
+        }
+    }
+
+    # Method 2: Volume label (hidden CD-ROM)
+    if (-not $userData) {
+        $vol = Get-WmiObject -Class Win32_Volume | Where-Object { $_.Label -eq "config-2" -or $_.Label -eq "cidata" }
+        if ($vol) {
+            $mountPoint = $vol.DeviceID
+            $paths = @(
+                "${mountPoint}user-data",
+                "${mountPoint}openstack\latest\user_data"
+            )
+            foreach ($p in $paths) {
+                if (Test-Path $p) {
+                    $userData = Get-Content $p -Raw
+                    break
+                }
+            }
+        }
+    }
+
+    return $userData
+}
+
+function Apply-Password {
+    $userData = Get-CloudInitUserData
+    if (-not $userData) { return }
+
+    if ($userData -match "password:\s*(.+)") {
+        $newPassword = $Matches[1].Trim()
+    } else { return }
+
+    $username = "Administrator"
+    if ($userData -match "user:\s*(.+)") {
+        $username = $Matches[1].Trim()
+    }
+
+    $hashFile = "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\.pw_hash"
+    $newHash = [System.BitConverter]::ToString(
+        [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+            [System.Text.Encoding]::UTF8.GetBytes($newPassword)
+        )
+    )
+
+    $oldHash = ""
+    if (Test-Path $hashFile) { $oldHash = (Get-Content $hashFile -Raw).Trim() }
+
+    if ($newHash -ne $oldHash) {
+        $result = net user $username "$newPassword" 2>&1
+        $user = [ADSI]"WinNT://./$username,user"
+        $user.UserFlags = $user.UserFlags.Value -bor 0x10000
+        $user.SetInfo()
+        $newHash | Set-Content $hashFile -Force
+        Write-Log "Password updated for $username (result: $result)"
+    }
+}
+
+Write-Log "PasswordWatcher started"
+Apply-Password
+
+while ($true) {
+    Start-Sleep -Seconds 10
+    try {
+        Apply-Password
+    } catch {
+        Write-Log "Error: $_"
+    }
+}
+'@ | Set-Content "$scriptDir\PasswordWatcher.ps1" -Force
+Write-OK "PasswordWatcher.ps1 created (real-time password sync every 10s)"
+
+@'
+# Hide cloud-init CD-ROM drive letter at startup
+$vol = Get-WmiObject -Class Win32_Volume | Where-Object { $_.Label -eq "config-2" -or $_.Label -eq "cidata" }
+if ($vol -and $vol.DriveLetter) {
+    $vol.DriveLetter = $null
+    $vol.Put()
+}
+'@ | Set-Content "$scriptDir\HideCDROM.ps1" -Force
+Write-OK "HideCDROM.ps1 created (hides cloud-init CD-ROM from users)"
+
+# Hide CD-ROM immediately during prep
+$vol = Get-WmiObject -Class Win32_Volume | Where-Object { $_.Label -eq "config-2" -or $_.Label -eq "cidata" }
+if ($vol -and $vol.DriveLetter) {
+    $vol.DriveLetter = $null
+    $vol.Put() | Out-Null
+    Write-OK "Cloud-init CD-ROM hidden immediately"
+} else {
+    Write-OK "Cloud-init CD-ROM already hidden or not present"
+}
+
+# =====================================================================
+# STEP 13: CREATE SCHEDULED TASKS
+# =====================================================================
+Write-Step "13/18" "Creating Scheduled Tasks"
+
+Unregister-ScheduledTask -TaskName "CloudInit-PasswordSync" -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "CloudInit-PasswordWatcher" -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "HideCloudInitCDROM" -Confirm:$false -ErrorAction SilentlyContinue
+
+$pwAction = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptDir\PasswordWatcher.ps1`""
+$pwTrigger = New-ScheduledTaskTrigger -AtStartup
+$pwSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Days 365)
+$pwPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+Register-ScheduledTask -TaskName "CloudInit-PasswordWatcher" -Action $pwAction -Trigger $pwTrigger `
+    -Settings $pwSettings -Principal $pwPrincipal -Force | Out-Null
+Write-OK "PasswordWatcher task registered (persistent, 10s interval)"
+
+$hideAction = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptDir\HideCDROM.ps1`""
+$hideTrigger = New-ScheduledTaskTrigger -AtStartup
+$hideSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$hidePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+Register-ScheduledTask -TaskName "HideCloudInitCDROM" -Action $hideAction -Trigger $hideTrigger `
+    -Settings $hideSettings -Principal $hidePrincipal -Force | Out-Null
+Write-OK "HideCDROM task registered (startup)"
+
+# =====================================================================
+# STEP 14: CLEAN EVENT LOGS
+# =====================================================================
+Write-Step "14/18" "Cleaning Event Logs"
+
+Get-EventLog -LogName * -ErrorAction SilentlyContinue | ForEach-Object {
+    Clear-EventLog -LogName $_.Log -ErrorAction SilentlyContinue
+}
+wevtutil el 2>$null | ForEach-Object {
+    $null = wevtutil cl "$_" 2>&1
+}
+Write-OK "All event logs cleared"
+
+# =====================================================================
+# STEP 15: DEEP DISK CLEANUP
+# =====================================================================
+Write-Step "15/18" "Deep Disk Cleanup"
+
+$freeBefore = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+Write-Host "  C: Free space before cleanup: ${freeBefore}GB" -ForegroundColor Gray
+
+# Windows Update - full SoftwareDistribution cleanup
+Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\SoftwareDistribution\*" -ErrorAction SilentlyContinue
+Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+Write-OK "SoftwareDistribution fully cleaned"
+
+# Component Store cleanup (WinSxS - biggest space saver)
+Write-Host "  Running DISM Component Store cleanup (this may take a few minutes)..." -ForegroundColor White
+Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1 | Out-Null
+Write-OK "Component Store cleaned (WinSxS)"
+
+# Windows Installer cache (orphaned patches)
+Remove-Item -Recurse -Force 'C:\Windows\Installer\$PatchCache$\*' -ErrorAction SilentlyContinue
+Write-OK "Installer patch cache cleaned"
+
+# Windows old/upgrade leftovers
+Remove-Item -Recurse -Force "C:\Windows.old" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\Downloaded Program Files\*" -ErrorAction SilentlyContinue
+Write-OK "Old Windows files cleaned"
+
+# CBS/DISM logs
+Remove-Item -Force "C:\Windows\Logs\CBS\*.log" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\Logs\DISM\*.log" -ErrorAction SilentlyContinue
+Write-OK "CBS/DISM logs cleaned"
+
+# Temp folders
+Remove-Item -Recurse -Force "$env:TEMP\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\Temp\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Temp\*" -ErrorAction SilentlyContinue
+Write-OK "Temp folders cleaned"
+
+# Prefetch
+Remove-Item -Recurse -Force "C:\Windows\Prefetch\*" -ErrorAction SilentlyContinue
+Write-OK "Prefetch cleaned"
+
+# DNS cache
+ipconfig /flushdns 2>&1 | Out-Null
+Write-OK "DNS cache flushed"
+
+# Thumbnail cache
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\Explorer\thumbcache_*" -ErrorAction SilentlyContinue
+Write-OK "Thumbnail cache cleaned"
+
+# Recent files
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Roaming\Microsoft\Windows\Recent\*" -ErrorAction SilentlyContinue
+Write-OK "Recent files cleaned"
+
+# Cloudbase-init logs and hash
+Remove-Item -Force "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\*.log" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\.pw_hash" -ErrorAction SilentlyContinue
+Write-OK "Cloudbase-init logs and hash file cleaned"
+
+# Windows Error Reports
+Remove-Item -Recurse -Force "C:\ProgramData\Microsoft\Windows\WER\*" -ErrorAction SilentlyContinue
+Write-OK "Windows Error Reports cleaned"
+
+# Recycle Bin
+Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+Write-OK "Recycle Bin emptied"
+
+# Default IIS folder
+if (Test-Path "C:\inetpub") {
+    Remove-Item -Recurse -Force "C:\inetpub" -ErrorAction SilentlyContinue
+    Write-OK "Default IIS folder (inetpub) removed"
+}
+
+# Additional cleanup (replacing cleanmgr which gets stuck)
+Remove-Item -Recurse -Force "C:\Windows\Downloaded Program Files\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\INetCache\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Users\*\AppData\Local\Microsoft\Windows\INetCookies\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\System32\LogFiles\*" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\ProgramData\Microsoft\Windows Defender\Scans\History\*" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\setupact.log" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\setuperr.log" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\*.log" -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "C:\Windows\Minidump\*" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\Windows\MEMORY.DMP" -ErrorAction SilentlyContinue
+Write-OK "Additional system files cleaned"
+
+$freeAfter = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+$saved = [math]::Round($freeAfter - $freeBefore, 2)
+Write-Host ""
+Write-Host "  C: Free space after cleanup: ${freeAfter}GB (saved ${saved}GB)" -ForegroundColor Yellow
+
+# =====================================================================
+# STEP 16: REMOVE TEMPLATE PREP SCRIPTS
+# =====================================================================
+Write-Step "16/18" "Removing Template Prep Scripts"
+
+Remove-Item -Force "C:\WinServer-Template-Prep.ps1" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\WinServer-Template-Prep-v2.ps1" -ErrorAction SilentlyContinue
+Remove-Item -Force "C:\WinServer-Template-Prep-v3.ps1" -ErrorAction SilentlyContinue
+Write-OK "Template prep scripts removed from C:\"
+
+# =====================================================================
+# STEP 17: FINAL VERIFICATION
+# =====================================================================
+Write-Step "17/18" "Final Verification"
+
+Write-Host ""
+Write-Host "  --- SYSTEM ---" -ForegroundColor White
+Write-Host "  OS: $osVersion" -ForegroundColor Gray
+Write-Host "  Hostname: $newHostname (overridden by Cloudbase-init on deploy)" -ForegroundColor Gray
+Write-Host "  Timezone: $($tz.DisplayName)" -ForegroundColor Gray
+Write-Host "  RDP: Enabled (NLA disabled)" -ForegroundColor Gray
+Write-Host "  Power Plan: High Performance" -ForegroundColor Gray
+Write-Host "  Hibernation: Disabled" -ForegroundColor Gray
+Write-Host "  Pagefile: Disabled (auto per VM)" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- USERS ---" -ForegroundColor White
+$users = net user 2>&1
+Write-Host "  $users" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- CLOUDBASE-INIT ---" -ForegroundColor White
+Write-Host "  Config: $(Test-Path "$cbConfPath\cloudbase-init.conf")" -ForegroundColor Gray
+Write-Host "  Unattend Config: $(Test-Path "$cbConfPath\cloudbase-init-unattend.conf")" -ForegroundColor Gray
+Write-Host "  Unattend.xml: $(Test-Path "$cbConfPath\Unattend.xml")" -ForegroundColor Gray
+Write-Host "  SetPassword.ps1: $(Test-Path "$scriptDir\SetPassword.ps1")" -ForegroundColor Gray
+Write-Host "  PasswordWatcher.ps1: $(Test-Path "$scriptDir\PasswordWatcher.ps1")" -ForegroundColor Gray
+Write-Host "  HideCDROM.ps1: $(Test-Path "$scriptDir\HideCDROM.ps1")" -ForegroundColor Gray
+Write-Host "  Service Account: LocalSystem" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- SCHEDULED TASKS ---" -ForegroundColor White
+$watchTask = Get-ScheduledTask -TaskName "CloudInit-PasswordWatcher" -ErrorAction SilentlyContinue
+$hideTask = Get-ScheduledTask -TaskName "HideCloudInitCDROM" -ErrorAction SilentlyContinue
+Write-Host "  PasswordWatcher (10s): $($watchTask.State)" -ForegroundColor Gray
+Write-Host "  HideCDROM (startup): $($hideTask.State)" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- PASSWORD POLICY ---" -ForegroundColor White
+$maxPwAge = net accounts 2>&1 | Select-String "Maximum password age"
+Write-Host "  $($maxPwAge.ToString().Trim())" -ForegroundColor Gray
+Write-Host ""
+
+Write-Host "  --- PARTITIONS ---" -ForegroundColor White
+Get-Partition -DiskNumber 0 | ForEach-Object {
+    Write-Host "  Partition $($_.PartitionNumber): $($_.Type) - $([math]::Round($_.Size/1GB, 2))GB" -ForegroundColor Gray
+}
+Write-Host ""
+
+Write-Host "  --- DISK USAGE ---" -ForegroundColor White
+$finalFree = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+$finalUsed = [math]::Round((Get-PSDrive C).Used / 1GB, 2)
+Write-Host "  C: Used: ${finalUsed}GB / Free: ${finalFree}GB" -ForegroundColor Gray
+Write-Host ""
+
+# =====================================================================
+# STEP 18: SYSPREP
+# =====================================================================
+Write-Step "18/18" "Sysprep"
+
+Stop-Transcript
+
+if ($SkipSysprep) {
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Yellow
+    Write-Host "  PREPARATION COMPLETE (Sysprep skipped)" -ForegroundColor Yellow
+    Write-Host "================================================================" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Run Sysprep manually when ready:" -ForegroundColor White
+    Write-Host '  cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"' -ForegroundColor Cyan
+    Write-Host '  C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml' -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  After VM shuts down, on Proxmox host:" -ForegroundColor White
+    Write-Host "  qm set <VMID> --ide2 local-zfs:cloudinit" -ForegroundColor Cyan
+    Write-Host "  qm set <VMID> --boot c --bootdisk scsi0" -ForegroundColor Cyan
+    Write-Host "  qm template <VMID>" -ForegroundColor Cyan
+    exit
+}
+
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Yellow
+Write-Host "  PREPARATION COMPLETE!" -ForegroundColor Yellow
+Write-Host "================================================================" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  The VM will now Sysprep and SHUTDOWN automatically." -ForegroundColor White
+Write-Host ""
+Write-Host "  After VM shuts down, on Proxmox host run:" -ForegroundColor White
+Write-Host "  qm set <VMID> --ide2 local-zfs:cloudinit" -ForegroundColor Cyan
+Write-Host "  qm set <VMID> --boot c --bootdisk scsi0" -ForegroundColor Cyan
+Write-Host "  qm template <VMID>" -ForegroundColor Cyan
+Write-Host ""
+
+$confirmSysprep = Read-Host "Run Sysprep now? (yes/no)"
+if ($confirmSysprep -eq "yes") {
+    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+    cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"
+    C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml
+} else {
+    Write-Host ""
+    Write-Host "Sysprep skipped. Run manually when ready:" -ForegroundColor Yellow
+    Write-Host '  cd "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf"' -ForegroundColor Cyan
+    Write-Host '  C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:Unattend.xml' -ForegroundColor Cyan
+}
