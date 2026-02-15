@@ -726,4 +726,4 @@ Write-OK "SoftwareDistribution fully cleaned"
 
 Write-Host "  Running DISM Component Store cleanup (this may take a few minutes)..." -ForegroundColor White
 Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase
-Write-OK "Component Store cleaned (
+Write-OK "Component Store cleaned"
