@@ -54,19 +54,26 @@ Write-Host ""
 # =====================================================================
 Write-Step "X/18" "Installing Google Chrome"
 
-$chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-if (Test-Path $chromePath) {
+$chromeInstalled = (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe") -or
+                   (Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") -or
+                   (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "Google Chrome" })
+if ($chromeInstalled) {
     Write-Warn "Google Chrome already installed, skipping"
 } else {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $chromeUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
     $chromeInstaller = "$env:TEMP\chrome_installer.exe"
     Write-Host "  Downloading Google Chrome..." -ForegroundColor White
-    Invoke-WebRequest -Uri $chromeUrl -OutFile $chromeInstaller -UseBasicParsing
-    Write-OK "Downloaded"
-    Write-Host "  Installing Google Chrome..." -ForegroundColor White
-    Start-Process $chromeInstaller -ArgumentList "/silent /install" -Wait
-    Remove-Item $chromeInstaller -Force -ErrorAction SilentlyContinue
-    Write-OK "Google Chrome installed"
+    try {
+        Invoke-WebRequest -Uri $chromeUrl -OutFile $chromeInstaller -UseBasicParsing
+        Write-OK "Downloaded"
+        Write-Host "  Installing Google Chrome..." -ForegroundColor White
+        Start-Process $chromeInstaller -ArgumentList "/silent /install" -Wait
+        Remove-Item $chromeInstaller -Force -ErrorAction SilentlyContinue
+        Write-OK "Google Chrome installed"
+    } catch {
+        Write-Warn "Could not download Chrome (no internet?). Skipping."
+    }
 }
 # =====================================================================
 # STEP 1: CHECK AND INSTALL VIRTIO DRIVERS + QEMU GUEST AGENT
