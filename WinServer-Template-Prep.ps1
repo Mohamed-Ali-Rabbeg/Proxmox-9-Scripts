@@ -186,7 +186,7 @@ Write-OK "NTP time sync configured"
 # =====================================================================
 Write-Step "3/19" "Setting Professional Hostname"
 
-$randomSuffix = -join ((65..90) + (48..57) | Get-Random -Count 5 | ForEach-Object { [char]$_ })
+$randomSuffix = -join ((65..90) + (48..57) | Get-Random -Count 10 | ForEach-Object { [char]$_ })
 $newHostname = "WIN-$osShort-$randomSuffix"
 Write-Host "  Current hostname: $env:COMPUTERNAME" -ForegroundColor Gray
 Write-Host "  New hostname: $newHostname" -ForegroundColor White
