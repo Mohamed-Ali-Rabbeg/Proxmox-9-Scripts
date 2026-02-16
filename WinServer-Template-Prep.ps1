@@ -52,7 +52,7 @@ Write-Host ""
 # =====================================================================
 # STEP 0 : INSTALL GOOGLE CHROME
 # =====================================================================
-Write-Step "X/18" "Installing Google Chrome"
+Write-Step "0/18" "Installing Google Chrome"
 
 $chromeInstalled = (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe") -or
                    (Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe") -or
